@@ -9,11 +9,12 @@ defmodule MobPair.Pairings do
   certificate for TLS distribution; a pairing it replaces (same node name)
   is revoked first. `revoke/1` (the host's Disconnect, or a sibling's unpair
   request) replaces the node's cookie with a random one, aborts a
-  distribution handshake of that node already under way, disconnects it and
-  unpins its certificate, so neither the old cookie nor the certificate
-  opens a connection again; a connection of a revoked name that still comes
-  up is dropped at `nodeup`. Revoking can't undo what a connected node
-  already did: distribution is full trust.
+  distribution handshake of that node already under way (before and after
+  disconnecting it), disconnects it and unpins its certificate, so neither
+  the old cookie nor the certificate opens a connection again; for twice
+  `net_setuptime`, a connection of a revoked name that still comes up is
+  dropped at `nodeup`. Revoking can't undo what a connected node already
+  did: distribution is full trust.
 
   ## Distribution started after the registry
 
@@ -90,8 +91,10 @@ defmodule MobPair.Pairings do
   new cookie. `request`: `%{node, app_id, app_name, device_name, client_fp,
   dist_proto}` (`dist_proto`: the carrier granted); a `cookie` and
   `paired_at` in it are reused (restoring stored pairings).
+  `{:error, :fingerprint_in_use}` when another node's pairing pinned
+  `client_fp`.
   """
-  @spec add(map()) :: {:ok, pairing()}
+  @spec add(map()) :: {:ok, pairing()} | {:error, :fingerprint_in_use}
   def add(request), do: GenServer.call(__MODULE__, {:add, request})
 
   @doc """
@@ -225,7 +228,7 @@ defmodule MobPair.Pairings do
       also_allow: Keyword.get(opts, :also_allow, []),
       allow?: false,
       monitoring: nil,
-      revoked: MapSet.new(),
+      revoked: %{},
       subscribers: %{}
     }
 
@@ -247,18 +250,18 @@ defmodule MobPair.Pairings do
         paired_at: request[:paired_at] || System.os_time(:second)
       })
 
-    # The pairing this one replaces loses its cookie and its connection first.
-    state = cut(state, pairing.node)
-    put(pairing, state)
-
-    state = %{
-      state
-      | revoked: MapSet.delete(state.revoked, String.to_existing_atom(pairing.node))
-    }
-
-    save(state)
-    notify(state, :added, pairing)
-    {:reply, {:ok, pairing}, state}
+    # One certificate, one name: the Front maps a certificate to its node.
+    if node_for_fp(pairing.client_fp) in [nil, pairing.node] do
+      # The pairing this one replaces loses its cookie and its connection first.
+      state = cut(state, pairing.node)
+      put(pairing, state)
+      state = %{state | revoked: Map.delete(state.revoked, String.to_existing_atom(pairing.node))}
+      save(state)
+      notify(state, :added, pairing)
+      {:reply, {:ok, pairing}, state}
+    else
+      {:reply, {:error, :fingerprint_in_use}, state}
+    end
   end
 
   def handle_call({:revoke, node}, _from, state) do
@@ -286,20 +289,29 @@ defmodule MobPair.Pairings do
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state),
     do: {:noreply, %{state | subscribers: Map.delete(state.subscribers, ref)}}
 
-  # A handshake of a revoked name that got past cut/2 (it had read the old
-  # cookie while another connection of that name was up): dropped at once.
+  # A connection of a revoked name that got past cut/2 anyway: dropped at
+  # once. Only for the handshake window after the revoke, so the name can
+  # come back another way (FMutate's same-key Allow) afterwards.
   def handle_info({:nodeup, node, _info}, state) do
-    if MapSet.member?(state.revoked, node), do: :erlang.disconnect_node(node)
+    if Map.has_key?(state.revoked, node), do: :erlang.disconnect_node(node)
     {:noreply, state}
   end
 
   def handle_info({:nodedown, _node, _info}, state), do: {:noreply, state}
 
+  def handle_info({:revoke_window_over, atom, ref}, state) do
+    case state.revoked do
+      %{^atom => ^ref} -> {:noreply, %{state | revoked: Map.delete(state.revoked, atom)}}
+      _ -> {:noreply, state}
+    end
+  end
+
   # Revokes the pairing of `node` (if any): unpinned, a random cookie (first,
   # so a handshake starting now fails), the handshake already under way
   # aborted (net_kernel's disconnect leaves pending connections alone, and
   # dist_util read the cookie when it marked the connection pending), the
-  # connection cut, subscribers told.
+  # connection cut, then a handshake that was parked behind it (up_pending,
+  # now pending) aborted too, subscribers told.
   defp cut(state, node) do
     case :ets.take(@table, node) do
       [{^node, atom, pairing}] ->
@@ -307,15 +319,22 @@ defmodule MobPair.Pairings do
           :erlang.set_cookie(atom, random_cookie_atom())
           abort_handshake(atom)
           :erlang.disconnect_node(atom)
+          abort_handshake(atom)
         end
 
         notify(state, :revoked, pairing)
-        %{state | revoked: MapSet.put(state.revoked, atom)}
+        ref = make_ref()
+        Process.send_after(self(), {:revoke_window_over, atom, ref}, revoke_window())
+        %{state | revoked: Map.put(state.revoked, atom, ref)}
 
       [] ->
         state
     end
   end
+
+  # Twice the distribution setup time: any handshake that read the old
+  # cookie has finished or timed out by then.
+  defp revoke_window, do: round(:application.get_env(:kernel, :net_setuptime, 7) * 2_000)
 
   defp abort_handshake(atom) do
     case :net_kernel.node_info(atom) do

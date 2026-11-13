@@ -375,6 +375,54 @@ defmodule MobPair.DistTest do
       refute String.to_atom(name) in :peer.call(host.peer, :erlang, :nodes, [:hidden])
     end
 
+    test "revoking aborts a handshake parked behind the node's live connection" do
+      host = start_host(:inet_tcp)
+      {:ok, link} = Link.parse(:peer.call(host.peer, Host, :link, [Host]))
+      {:ok, record} = Client.pair(target(host), {:token, link.token}, identity())
+      {:ok, _conn} = Transport.connect(record, self())
+      name = record.self_node
+
+      # a second handshake under the connected name waits (up_pending) for the first to go
+      {:ok, socket} =
+        :gen_tcp.connect(~c"127.0.0.1", host.port, [:binary, active: false, packet: 2])
+
+      :ok =
+        :gen_tcp.send(socket, <<?N, @dist_flags::64, 1::32, byte_size(name)::16, name::binary>>)
+
+      assert {:ok, "salive"} = :gen_tcp.recv(socket, 0, 5_000)
+      :ok = :gen_tcp.send(socket, "strue")
+      assert {:ok, <<?N, _::64, challenge::32, _::binary>>} = :gen_tcp.recv(socket, 0, 5_000)
+
+      :ok = :peer.call(host.peer, Pairings, :revoke, [name])
+
+      digest = :erlang.md5([record.cookie, Integer.to_string(challenge)])
+      :ok = :gen_tcp.send(socket, <<?r, 42::32, digest::binary>>)
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, 5_000)
+    end
+
+    test "a revoked name may come back another way once the revoke's window is over" do
+      host = start_host(:inet_tcp)
+      # the window is twice net_setuptime: 2 s here
+      :ok = :peer.call(host.peer, :application, :set_env, [:kernel, :net_setuptime, 1])
+      {:ok, link} = Link.parse(:peer.call(host.peer, Host, :link, [Host]))
+      {:ok, record} = Client.pair(target(host), {:token, link.token}, identity())
+      {:ok, conn} = Transport.connect(record, self())
+      Node.monitor(conn.node, true)
+      :ok = :peer.call(host.peer, Pairings, :revoke, [record.self_node])
+      assert_receive {:nodedown, _}, 5_000
+      Transport.disconnect(conn)
+
+      # the host lets the name in with another cookie (FMutate: its same-key Allow)
+      other = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+      true = :peer.call(host.peer, :erlang, :set_cookie, [node(), String.to_atom(other)])
+      Process.sleep(2_500)
+
+      assert {:ok, conn} = Transport.connect(%{record | cookie: other}, self())
+      Process.sleep(500)
+      assert node() in :peer.call(host.peer, :erlang, :nodes, [:hidden])
+      echo(conn, :back_again)
+    end
+
     test "replacing a pairing drops the old app's connection" do
       host = start_host(:inet_tcp)
       {:ok, link} = Link.parse(:peer.call(host.peer, Host, :link, [Host]))

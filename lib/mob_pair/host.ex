@@ -74,8 +74,9 @@ defmodule MobPair.Host do
   `:firmware` (the detail line siblings show), `:node` (the host's node
   name, default `node()`), `:ip` (an address or a list of them to listen on;
   default 127.0.0.1 and `:host`), `:port` (default 0: any, the same on every
-  address), `:host` (the address put in the link; default the first
-  non-loopback IPv4 address), `:ttl` (ms), `:max_attempts`, `:approve`,
+  address), `:host` (the address put in the link; default the IPv4 address
+  of a Wi-Fi/Ethernet interface (`wlan*`, `en*`, `eth*`), else 127.0.0.1:
+  never mobile data or VPN), `:ttl` (ms), `:max_attempts`, `:approve`,
   `:reserved` (a function of a requested node name, true when something
   outside `:pairings` already uses it: refused with `bad_node`), `:notify`
   (a pid), `:pairings` (a module with `add/1`, `get/1` and `node_for_fp/1`,
@@ -726,24 +727,29 @@ defmodule MobPair.Host do
         do: {"127.0.0.1", config.loopback_port, config.loopback_proto},
         else: {config.dist_host, config.dist_port, :inet_tls}
 
-    {:ok, pairing} =
-      request
-      |> Map.take([:node, :app_id, :app_name, :device_name, :client_fp])
-      |> Map.put(:dist_proto, proto)
-      |> config.pairings.add()
+    request
+    |> Map.take([:node, :app_id, :app_name, :device_name, :client_fp])
+    |> Map.put(:dist_proto, proto)
+    |> config.pairings.add()
+    |> case do
+      {:ok, pairing} ->
+        Wire.send(socket, %{
+          "type" => "granted",
+          "inst" => config.inst,
+          "name" => config.name,
+          "device" => config.device,
+          "firmware" => config.firmware,
+          "node" => config.node,
+          "dist_host" => host,
+          "dist_port" => port,
+          "dist_proto" => Atom.to_string(proto),
+          "cookie" => pairing.cookie
+        })
 
-    Wire.send(socket, %{
-      "type" => "granted",
-      "inst" => config.inst,
-      "name" => config.name,
-      "device" => config.device,
-      "firmware" => config.firmware,
-      "node" => config.node,
-      "dist_host" => host,
-      "dist_port" => port,
-      "dist_proto" => Atom.to_string(proto),
-      "cookie" => pairing.cookie
-    })
+      # another request pinned the same certificate while this one waited for Allow
+      {:error, :fingerprint_in_use} ->
+        {:error, Wire.error("bad_cert")}
+    end
   end
 
   defp recv(socket) do
@@ -780,17 +786,24 @@ defmodule MobPair.Host do
 
   defp short_name(node), do: node |> String.split("@") |> hd()
 
+  # The Wi-Fi (or Ethernet) address: never a mobile-data, VPN or tethering
+  # interface; loopback only when there is none.
   defp default_host do
-    {:ok, addresses} = :inet.getifaddrs()
+    {:ok, interfaces} = :inet.getifaddrs()
 
-    addresses
-    |> Enum.flat_map(fn {_name, opts} -> Keyword.get_values(opts, :addr) end)
-    |> Enum.find(&match?({a, _, _, _} when a != 127, &1))
-    |> case do
-      nil -> "127.0.0.1"
-      ip -> ip |> :inet.ntoa() |> List.to_string()
-    end
+    Enum.find_value(interfaces, "127.0.0.1", fn {name, opts} ->
+      with true <- lan_interface?(List.to_string(name)),
+           true <- :up in Keyword.get(opts, :flags, []),
+           {a, b, _, _} = ip when a != 127 and {a, b} != {169, 254} <-
+             Enum.find(Keyword.get_values(opts, :addr), &match?({_, _, _, _}, &1)) do
+        ip |> :inet.ntoa() |> List.to_string()
+      else
+        _ -> nil
+      end
+    end)
   end
+
+  defp lan_interface?(name), do: Enum.any?(["wlan", "en", "eth"], &String.starts_with?(name, &1))
 
   defp hostname do
     {:ok, name} = :inet.gethostname()

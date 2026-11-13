@@ -93,14 +93,16 @@ rather than changing v1's; JSON keeps both ends free of atoms from the network.
 - **Grant:** a per-peer cookie (32 random bytes, base64url) set for exactly the node name the
   joiner declared (the atom is made only after Allow), and the joiner's own certificate pinned
   (its key never leaves the joiner; the request doesn't prove possession, so a certificate
-  already pinned for another node is refused: `bad_cert`). A replaced pairing is revoked
-  first.
+  already pinned for another node is refused: `bad_cert` at the request, and
+  `Pairings.add/1` refuses it too). A replaced pairing is revoked first.
 - **Revoke** (Disconnect, the joiner's `unpair`, a replacement): the cookie is replaced with a
   random one first, a handshake of that node already under way is aborted (`net_kernel`'s
   disconnect leaves pending connections alone, and `dist_util` reads the cookie when it marks
-  the connection pending), the connection is cut and the certificate unpinned; a connection
-  of a revoked name that still comes up (a handshake parked behind a live connection) is
-  dropped at `nodeup`. Revoking can't undo what a connected node already did: distribution is
+  the connection pending), the connection is cut, then a handshake that was parked behind it
+  (`up_pending`, which the disconnect turns into `pending`) is aborted too, and the certificate
+  is unpinned. For twice `net_setuptime` after a revoke, a connection of that name that still
+  comes up is dropped at `nodeup`; after that the name may come back another way (FMutate's
+  same-key Allow). Revoking can't undo what a connected node already did: distribution is
   full trust.
 - **Carriers:** plain `inet_tcp` only on loopback (the host's listener bound to 127.0.0.1);
   a joiner on another address is always granted `inet_tls` (mutual TLS 1.3, both certificates

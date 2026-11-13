@@ -83,6 +83,16 @@ defmodule MobPair.PairingsTest do
     refute_receive {:mob_pair_pairings, _, _}
   end
 
+  test "one certificate, one node: a second node can't pin a pinned certificate" do
+    start_supervised!(Pairings)
+    {:ok, a} = Pairings.add(request("humdinger_a@127.0.0.1"))
+
+    assert Pairings.add(request("magpie_b@127.0.0.1", %{client_fp: a.client_fp})) ==
+             {:error, :fingerprint_in_use}
+
+    assert Pairings.list() == [a]
+  end
+
   test "a pairing replaced under the same node name is revoked first" do
     start_supervised!(Pairings)
     :ok = Pairings.subscribe(self())
