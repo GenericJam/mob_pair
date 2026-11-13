@@ -6,10 +6,21 @@ defmodule MobPair.Pairings do
 
   On Allow, `add/1` makes a cookie (32 random bytes, base64url), sets it for
   exactly the node name the sibling declared, and pins the sibling's
-  certificate for TLS distribution. `revoke/1` (the host's Disconnect, or a
-  sibling's unpair request) disconnects the node, replaces its cookie with a
-  random one and unpins its certificate, so neither the old cookie nor the
-  certificate opens a connection again.
+  certificate for TLS distribution; a pairing it replaces (same node name)
+  is revoked first. `revoke/1` (the host's Disconnect, or a sibling's unpair
+  request) replaces the node's cookie with a random one, aborts a
+  distribution handshake of that node already under way, disconnects it and
+  unpins its certificate, so neither the old cookie nor the certificate
+  opens a connection again; a connection of a revoked name that still comes
+  up is dropped at `nodeup`. Revoking can't undo what a connected node
+  already did: distribution is full trust.
+
+  ## Distribution started after the registry
+
+  Cookies, the default cookie and the allow list belong to the running
+  node. A host whose distribution starts at runtime (a Mob app) starts the
+  registry with its other processes and calls `distribution_started/0`
+  once `Node.start/2` returned; until then paired siblings can't connect.
 
   TLS distribution checks client certificates with `verify_client/4`; write
   the `-ssl_dist_optfile` with `write_ssl_dist_optfile/2`. A TLS front that
@@ -41,7 +52,8 @@ defmodule MobPair.Pairings do
   declares; any unpaired name meets the random default cookie.
 
   `subscribe/1` sends `{:mob_pair_pairings, :added | :revoked, pairing}` to
-  a process on every change.
+  a process on every change (a replaced pairing: `:revoked` for the old one,
+  then `:added`).
   """
 
   use GenServer
@@ -81,6 +93,16 @@ defmodule MobPair.Pairings do
   """
   @spec add(map()) :: {:ok, pairing()}
   def add(request), do: GenServer.call(__MODULE__, {:add, request})
+
+  @doc """
+  Applies the pairings to the node once its distribution runs (see the
+  moduledoc): the per-node cookies, the `:default_cookie` and `:allow_list`
+  options, and the `nodeup` watch for revoked names. Called by `start_link/1`
+  when the node is already alive; call it again after starting distribution
+  later (or restarting it). Idempotent.
+  """
+  @spec distribution_started() :: :ok
+  def distribution_started, do: GenServer.call(__MODULE__, :distribution_started)
 
   @doc "Revokes the pairing of `node` (a string or atom)."
   @spec revoke(node() | String.t()) :: :ok
@@ -150,25 +172,39 @@ defmodule MobPair.Pairings do
   end
 
   @doc """
-  Writes `contents` to `path` readable by its owner only: created 0600
-  before anything is written, then renamed into place. For files holding
+  Writes `contents` to `path` readable by its owner only: written in a new
+  0700 directory next to `path` (so no other user can open the file before
+  it is 0600), synced to disk, then renamed into place. For files holding
   secrets (the host's private key, the pairings' cookies); keep them in
   app-private storage.
   """
   @spec write_private(Path.t(), iodata()) :: :ok | {:error, File.posix()}
   def write_private(path, contents) do
-    tmp = "#{path}.tmp-#{System.unique_integer([:positive])}"
+    dir = "#{path}.tmp-#{System.unique_integer([:positive])}"
+    tmp = Path.join(dir, "contents")
 
-    with {:ok, io} <- File.open(tmp, [:write, :exclusive]),
-         :ok <- File.chmod(tmp, 0o600),
-         :ok <- IO.binwrite(io, contents),
-         :ok <- File.close(io),
+    with :ok <- File.mkdir(dir),
+         :ok <- File.chmod(dir, 0o700),
+         :ok <- write_synced(tmp, contents),
          :ok <- File.rename(tmp, path) do
+      File.rmdir(dir)
       :ok
     else
       {:error, _} = error ->
-        File.rm(tmp)
+        File.rm_rf(dir)
         error
+    end
+  end
+
+  defp write_synced(path, contents) do
+    with {:ok, io} <- File.open(path, [:write, :exclusive, :raw, :binary]) do
+      try do
+        with :ok <- File.chmod(path, 0o600),
+             :ok <- :file.write(io, contents),
+             do: :file.sync(io)
+      after
+        :file.close(io)
+      end
     end
   end
 
@@ -184,18 +220,16 @@ defmodule MobPair.Pairings do
 
     state = %{
       store: Keyword.get(opts, :store),
-      allow?: Keyword.get(opts, :allow_list, :auto) == :auto and plain_dist?(),
+      default_cookie: Keyword.get(opts, :default_cookie, :random),
+      allow_list: Keyword.get(opts, :allow_list, :auto),
+      also_allow: Keyword.get(opts, :also_allow, []),
+      allow?: false,
+      monitoring: nil,
+      revoked: MapSet.new(),
       subscribers: %{}
     }
 
-    if Node.alive?() do
-      if Keyword.get(opts, :default_cookie, :random) == :random,
-        do: :erlang.set_cookie(random_cookie_atom())
-
-      if state.allow?,
-        do: :ok = :net_kernel.allow([@nobody | Keyword.get(opts, :also_allow, [])])
-    end
-
+    state = apply_distribution(state)
     Enum.each(load(state.store), &put(&1, state))
     {:ok, state}
   end
@@ -213,27 +247,29 @@ defmodule MobPair.Pairings do
         paired_at: request[:paired_at] || System.os_time(:second)
       })
 
+    # The pairing this one replaces loses its cookie and its connection first.
+    state = cut(state, pairing.node)
     put(pairing, state)
+
+    state = %{
+      state
+      | revoked: MapSet.delete(state.revoked, String.to_existing_atom(pairing.node))
+    }
+
     save(state)
     notify(state, :added, pairing)
     {:reply, {:ok, pairing}, state}
   end
 
   def handle_call({:revoke, node}, _from, state) do
-    case :ets.take(@table, node) do
-      [{^node, atom, pairing}] ->
-        if Node.alive?() do
-          :erlang.disconnect_node(atom)
-          :erlang.set_cookie(atom, random_cookie_atom())
-        end
+    state = cut(state, node)
+    save(state)
+    {:reply, :ok, state}
+  end
 
-        save(state)
-        notify(state, :revoked, pairing)
-
-      [] ->
-        :ok
-    end
-
+  def handle_call(:distribution_started, _from, state) do
+    state = apply_distribution(state)
+    for {_node, _atom, pairing} <- :ets.tab2list(@table), do: put(pairing, state)
     {:reply, :ok, state}
   end
 
@@ -249,6 +285,72 @@ defmodule MobPair.Pairings do
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state),
     do: {:noreply, %{state | subscribers: Map.delete(state.subscribers, ref)}}
+
+  # A handshake of a revoked name that got past cut/2 (it had read the old
+  # cookie while another connection of that name was up): dropped at once.
+  def handle_info({:nodeup, node, _info}, state) do
+    if MapSet.member?(state.revoked, node), do: :erlang.disconnect_node(node)
+    {:noreply, state}
+  end
+
+  def handle_info({:nodedown, _node, _info}, state), do: {:noreply, state}
+
+  # Revokes the pairing of `node` (if any): unpinned, a random cookie (first,
+  # so a handshake starting now fails), the handshake already under way
+  # aborted (net_kernel's disconnect leaves pending connections alone, and
+  # dist_util read the cookie when it marked the connection pending), the
+  # connection cut, subscribers told.
+  defp cut(state, node) do
+    case :ets.take(@table, node) do
+      [{^node, atom, pairing}] ->
+        if Node.alive?() do
+          :erlang.set_cookie(atom, random_cookie_atom())
+          abort_handshake(atom)
+          :erlang.disconnect_node(atom)
+        end
+
+        notify(state, :revoked, pairing)
+        %{state | revoked: MapSet.put(state.revoked, atom)}
+
+      [] ->
+        state
+    end
+  end
+
+  defp abort_handshake(atom) do
+    case :net_kernel.node_info(atom) do
+      {:ok, info} ->
+        if info[:state] == :pending, do: Process.exit(info[:owner], :kill)
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  # The node-wide settings, once distribution runs (else at the next
+  # distribution_started/0).
+  defp apply_distribution(state) do
+    if Node.alive?() do
+      if state.default_cookie == :random, do: :erlang.set_cookie(random_cookie_atom())
+      allow? = state.allow_list == :auto and plain_dist?()
+      if allow?, do: :ok = :net_kernel.allow([@nobody | state.also_allow])
+      %{watch_nodes(state) | allow?: allow?}
+    else
+      state
+    end
+  end
+
+  # One nodeup subscription per net_kernel (a restarted distribution needs a new one).
+  defp watch_nodes(state) do
+    case Process.whereis(:net_kernel) do
+      kernel when kernel == state.monitoring ->
+        state
+
+      kernel ->
+        :ok = :net_kernel.monitor_nodes(true, node_type: :all)
+        %{state | monitoring: kernel}
+    end
+  end
 
   # The atoms are the node the user allowed and its cookie: one pair per
   # pairing, never made from an unapproved request.

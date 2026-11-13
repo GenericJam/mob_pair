@@ -13,6 +13,14 @@ defmodule MobPair.DistTest do
 
   @moduletag :capture_log
 
+  # The distribution flags OTP 26+ requires of a peer (dist.hrl: the OTP 25 and 26 mandatory
+  # sets, which include DFLAG_HANDSHAKE_23); no DFLAG_PUBLISHED: a hidden node.
+  @dist_flags Enum.reduce(
+                [0x04, 0x10, 0x80, 0x100, 0x200, 0x400, 0x800, 0x10000, 0x20000, 0x40000],
+                0x1000000 + 0x2000000 + 0x04 * 0x100000000,
+                &(&1 + &2)
+              )
+
   @host_module """
   defmodule MobPairTestHost do
     def allow(_request), do: :allow
@@ -61,7 +69,7 @@ defmodule MobPair.DistTest do
   # :inet_tcp (plain, loopback), :inet_tls (stock inet_tls_dist) or :front: a plain loopback node
   # whose TLS distribution is MobPair.Front, as FMutate runs it (the Host grants TLS to the front
   # even to loopback joiners here, so the test VM exercises the front).
-  defp start_host(proto, pairings \\ []) do
+  defp start_host(proto, pairings \\ [], front_ip \\ {127, 0, 0, 1}) do
     port = free_port()
     front_port = if proto == :front, do: free_port()
     name = "fmutate_t#{System.unique_integer([:positive])}"
@@ -117,7 +125,7 @@ defmodule MobPair.DistTest do
 
     front =
       if proto == :front,
-        do: [cert: cert, ip: {127, 0, 0, 1}, port: front_port, target: {{127, 0, 0, 1}, port}]
+        do: [cert: cert, ip: front_ip, port: front_port, target: {{127, 0, 0, 1}, port}]
 
     {:ok, _} = :peer.call(peer, MobPairTestHost, :start, [pairings, host, front])
     %{peer: peer, node: node, port: port, front_port: front_port, cert: cert}
@@ -329,6 +337,155 @@ defmodule MobPair.DistTest do
     on_port = tcp_sockets(host.peer) |> Enum.filter(&match?({_, p} when p == host.port, &1))
     assert on_port != []
     assert Enum.all?(on_port, &match?({{127, 0, 0, 1}, _}, &1))
+  end
+
+  describe "revocation and admission" do
+    test "revoking aborts a handshake that already read the old cookie" do
+      host = start_host(:inet_tcp)
+      name = Transport.random_node_name("humdinger")
+
+      {:ok, pairing} =
+        :peer.call(host.peer, Pairings, :add, [
+          %{
+            node: name,
+            app_id: "com.genericjam.humdinger",
+            app_name: "Humdinger",
+            device_name: "Test phone",
+            client_fp: :crypto.strong_rand_bytes(32),
+            dist_proto: :inet_tcp
+          }
+        ])
+
+      # Our side of the handshake by hand, up to the host's challenge: the
+      # host's handshake has read the pairing's cookie by then.
+      {:ok, socket} =
+        :gen_tcp.connect(~c"127.0.0.1", host.port, [:binary, active: false, packet: 2])
+
+      :ok =
+        :gen_tcp.send(socket, <<?N, @dist_flags::64, 1::32, byte_size(name)::16, name::binary>>)
+
+      assert {:ok, "sok"} = :gen_tcp.recv(socket, 0, 5_000)
+      assert {:ok, <<?N, _::64, challenge::32, _::binary>>} = :gen_tcp.recv(socket, 0, 5_000)
+
+      :ok = :peer.call(host.peer, Pairings, :revoke, [name])
+
+      digest = :erlang.md5([pairing.cookie, Integer.to_string(challenge)])
+      :ok = :gen_tcp.send(socket, <<?r, 42::32, digest::binary>>)
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, 5_000)
+      refute String.to_atom(name) in :peer.call(host.peer, :erlang, :nodes, [:hidden])
+    end
+
+    test "replacing a pairing drops the old app's connection" do
+      host = start_host(:inet_tcp)
+      {:ok, link} = Link.parse(:peer.call(host.peer, Host, :link, [Host]))
+      {:ok, record} = Client.pair(target(host), {:token, link.token}, identity())
+      {:ok, conn} = Transport.connect(record, self())
+      Node.monitor(conn.node, true)
+
+      {:ok, _} =
+        :peer.call(host.peer, Pairings, :add, [
+          %{
+            node: record.self_node,
+            app_id: "com.example.other",
+            app_name: "Other",
+            device_name: "Other phone",
+            client_fp: :crypto.strong_rand_bytes(32),
+            dist_proto: :inet_tcp
+          }
+        ])
+
+      assert_receive {:nodedown, node} when node == conn.node, 5_000
+    end
+
+    test "a host whose distribution starts later gets its pairings at distribution_started/0" do
+      path = Path.join(System.tmp_dir!(), "pairings_#{System.unique_integer([:positive])}.json")
+      on_exit(fn -> File.rm(path) end)
+      me = Cert.self_signed("Humdinger")
+      self_node = Transport.random_node_name("humdinger")
+      cookie = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+      :ok =
+        FileStore.save(
+          [
+            %{
+              node: self_node,
+              app_id: "com.genericjam.humdinger",
+              app_name: "Humdinger",
+              device_name: "Test phone",
+              client_fp: Cert.fingerprint(me.cert),
+              dist_proto: :inet_tcp,
+              cookie: cookie,
+              paired_at: 1_790_000_000
+            }
+          ],
+          path: path
+        )
+
+      port = free_port()
+      boot = MobPair.boot_args(dist_port: port, dist_proto: :inet_tcp)
+
+      args =
+        Enum.map(boot, &String.to_charlist/1) ++ Enum.flat_map(:code.get_path(), &[~c"-pa", &1])
+
+      {:ok, peer, :nonode@nohost} = :peer.start(%{connection: :standard_io, args: args})
+      on_exit(fn -> if Process.alive?(peer), do: :peer.stop(peer) end)
+      {:ok, _} = :peer.call(peer, Application, :ensure_all_started, [:elixir])
+
+      {:ok, _} =
+        :peer.call(peer, GenServer, :start, [
+          Pairings,
+          [store: {FileStore, path: path}],
+          [name: Pairings]
+        ])
+
+      refute :peer.call(peer, Node, :alive?, [])
+      name = :"fmutate_late#{System.unique_integer([:positive])}@127.0.0.1"
+      {:ok, _} = :peer.call(peer, :net_kernel, :start, [name, %{name_domain: :longnames}])
+      :ok = :peer.call(peer, Pairings, :distribution_started, [])
+
+      record = %Record{
+        service: "fmutate",
+        inst: "a",
+        node: Atom.to_string(name),
+        host: "127.0.0.1",
+        dist_port: port,
+        dist_proto: :inet_tcp,
+        fp: :crypto.strong_rand_bytes(32),
+        cookie: cookie,
+        self_node: self_node,
+        cert: me.cert,
+        key: me.key
+      }
+
+      assert {:ok, _conn} = Transport.connect(record, self())
+    end
+
+    test "idle connections from one address can't hold the front's slots" do
+      lan = lan_ip()
+      host = start_host(:front, [], {0, 0, 0, 0})
+      {:ok, link} = Link.parse(:peer.call(host.peer, Host, :link, [Host]))
+      {:ok, record} = Client.pair(target(host), {:token, link.token}, identity())
+
+      idle =
+        for _ <- 1..8,
+            {:ok, socket} <- [:gen_tcp.connect(~c"127.0.0.1", host.front_port, active: false)],
+            do: socket
+
+      on_exit(fn -> Enum.each(idle, &:gen_tcp.close/1) end)
+      assert {:ok, conn} = Transport.connect(%{record | host: lan}, self())
+      echo(conn, :through_the_crowd)
+    end
+  end
+
+  defp lan_ip do
+    {:ok, interfaces} = :inet.getifaddrs()
+
+    ip =
+      Enum.find_value(interfaces, fn {_name, opts} ->
+        Enum.find(Keyword.get_values(opts, :addr), &match?({a, _, _, _} when a != 127, &1))
+      end) || flunk("needs a non-loopback IPv4 address")
+
+    ip |> :inet.ntoa() |> List.to_string()
   end
 
   defp tcp_sockets(peer) do

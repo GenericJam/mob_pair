@@ -84,9 +84,13 @@ defmodule MobPair.Record do
   @spec host_node?(term()) :: boolean()
   def host_node?(name), do: self_node?(name)
 
-  @doc "Whether `name` is a well-formed node name for the joiner itself (`short@host`)."
+  @doc """
+  Whether `name` is a well-formed node name for the joiner itself
+  (`short@host`, at most 255 bytes: it becomes an atom once paired).
+  """
   @spec self_node?(term()) :: boolean()
-  def self_node?(name), do: is_binary(name) and Regex.match?(@self_node, name)
+  def self_node?(name),
+    do: is_binary(name) and byte_size(name) <= 255 and Regex.match?(@self_node, name)
 
   @doc "Whether `cookie` is a well-formed per-app cookie (base64url, 32–128 chars)."
   @spec cookie?(term()) :: boolean()

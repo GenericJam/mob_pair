@@ -40,6 +40,7 @@ defmodule MobPair.Join do
 
   @discovery_interval 2_000
   @fresh_candidates_ms 5_000
+  @max_tries 8
 
   @typedoc "What `pair/2` takes: a parsed link, or a typed code (optionally for one candidate)."
   @type offer :: Link.t() | %{required(:code) => String.t(), optional(:candidate) => map()}
@@ -313,14 +314,22 @@ defmodule MobPair.Join do
   end
 
   # Runs in its own process: tries each candidate in turn until one pairs.
+  # mDNS is unauthenticated: only unicast IPv4 (or this phone) is tried, and
+  # at most @max_tries hosts per code, so forged answers can't stall the
+  # pairing for long or send it to multicast or unspecified addresses.
   defp run_pairing(server, context, auth) do
-    candidates = Enum.filter(context.candidates || context.browse.(), & &1.port)
+    candidates =
+      (context.candidates || context.browse.())
+      |> Enum.filter(&(&1.port && (Record.remote_unicast?(&1.host) or loopback?(&1.host))))
+      |> Enum.take(@max_tries)
 
     case try_candidates(candidates, context, auth, :not_found) do
       {:ok, record, candidate} -> send(server, {:paired, self(), record, candidate})
       {:error, reason} -> send(server, {:pair_failed, self(), reason})
     end
   end
+
+  defp loopback?(host), do: is_binary(host) and Record.loopback?(host)
 
   defp try_candidates([], _context, _auth, reason), do: {:error, reason}
 

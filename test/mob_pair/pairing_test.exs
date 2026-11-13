@@ -348,7 +348,13 @@ defmodule MobPair.PairingTest do
 
     test "the Allow sheet gets clean names and is told when a pairing would be replaced" do
       {server, _} = start_server(approve: {:ask, self()})
-      sneaky = %{identity() | device_name: "Pixel\n7\u202E", app_name: "Hum\u200Bdinger"}
+
+      sneaky = %{
+        identity()
+        | device_name: "Pixel\n7\u202E",
+          app_name: "Hum\u200Bdinger\u2028\u2029this  phone"
+      }
+
       test = self()
 
       spawn(fn ->
@@ -358,7 +364,7 @@ defmodule MobPair.PairingTest do
       assert_receive {:mob_pair_request, ^server, ref, request}
 
       assert {request.app_name, request.device_name, request.replaces} ==
-               {"Humdinger", "Pixel7", nil}
+               {"Humdingerthis phone", "Pixel7", nil}
 
       :ok = Host.decide(server, ref, :allow)
       assert_receive {:first, {:ok, _}}
@@ -366,16 +372,26 @@ defmodule MobPair.PairingTest do
       :ok = Host.renew(server)
       spawn(fn -> Client.pair(target(server), {:code, code(server)}, identity()) end)
       assert_receive {:mob_pair_request, ^server, ref, request}
-      assert %{app_name: "Humdinger", device_name: "Pixel7"} = request.replaces
+      assert %{app_name: "Humdingerthis phone", device_name: "Pixel7"} = request.replaces
       :ok = Host.decide(server, ref, :deny)
     end
 
-    test "the code and token stay out of the server's status and crash reports" do
-      {server, _} = start_server([])
+    test "the code, the token and the host's key stay out of status and crash reports" do
+      {server, fmutate} = start_server([])
       {:ok, link} = Link.parse(Host.link(server))
       shown = inspect(:sys.get_status(server), limit: :infinity, printable_limit: :infinity)
       refute shown =~ code(server)
       refute shown =~ inspect(link.token, limit: :infinity)
+      refute shown =~ inspect(fmutate.key, limit: :infinity)
+
+      front =
+        start_supervised!(
+          {MobPair.Front,
+           cert: fmutate, ip: {127, 0, 0, 1}, target: {{127, 0, 0, 1}, 1}, node_for_fp: & &1}
+        )
+
+      shown = inspect(:sys.get_status(front), limit: :infinity, printable_limit: :infinity)
+      refute shown =~ inspect(fmutate.key, limit: :infinity)
     end
   end
 
@@ -453,6 +469,134 @@ defmodule MobPair.PairingTest do
       assert {:ok, _} = Client.pair(target(server), {:code, code(server)}, identity())
     end
   end
+
+  describe "hardening" do
+    test "the endpoint listens on loopback and the link's address only" do
+      lan = lan_ip()
+
+      opts = [
+        service: "fmutate",
+        cert: Cert.self_signed("FMutate A"),
+        node: "fmutate_a@127.0.0.1"
+      ]
+
+      opts = opts ++ [dist_port: 45_124, approve: fn _request -> :allow end]
+
+      # no Wi-Fi in the link: nothing but loopback
+      local = start_supervised!({Host, [host: "127.0.0.1"] ++ opts}, id: :local)
+      {:ok, link} = Link.parse(Host.link(local))
+      lan_target = %{target(local, link.fp) | host: lan}
+      assert Client.pair(lan_target, {:token, link.token}, identity()) == {:error, :unreachable}
+      assert {:ok, %{host: "127.0.0.1"}} = Link.parse(Host.local_link(local))
+
+      # the link's address and loopback, on one port
+      wifi = start_supervised!({Host, [host: lan] ++ opts}, id: :wifi)
+      {:ok, link} = Link.parse(Host.link(wifi))
+      {:ok, local_link} = Link.parse(Host.local_link(wifi))
+      assert {link.host, local_link.host, local_link.token} == {lan, "127.0.0.1", link.token}
+      assert {:ok, _} = Client.pair(target(wifi, link.fp), {:token, link.token}, identity())
+      :ok = Host.renew(wifi)
+      {:ok, link} = Link.parse(Host.link(wifi))
+      lan_target = %{target(wifi, link.fp) | host: lan}
+      other = %{identity() | node: "humdinger_other@127.0.0.1"}
+      assert {:ok, _} = Client.pair(lan_target, {:token, link.token}, other)
+    end
+
+    test "idle connections from one address can't hold every pairing slot" do
+      lan = lan_ip()
+      {server, fmutate} = start_server(ip: {0, 0, 0, 0}, host: lan)
+
+      # connections refused as busy may reset; the point is that a sibling still gets in
+      idle =
+        for _ <- 1..8,
+            {:ok, socket} <- [:gen_tcp.connect(~c"127.0.0.1", Host.port(server), active: false)],
+            do: socket
+
+      on_exit(fn -> Enum.each(idle, &:gen_tcp.close/1) end)
+      {:ok, link} = Link.parse(Host.link(server))
+      remote = %{target(server, fmutate.fp) | host: lan}
+      assert {:ok, _} = Client.pair(remote, {:token, link.token}, identity())
+    end
+
+    test "New code cancels an SRP exchange that started under the old code" do
+      {server, _} = start_server(notify: self())
+      old = code(server)
+      {:ok, socket} = :ssl.connect(~c"127.0.0.1", Host.port(server), any_cert(), 5_000)
+      {a_pub, _} = keys = MobPair.Srp.client_keys()
+      hello = %{"type" => "hello", "v" => 1, "inst" => "a", "auth" => "srp"}
+      :ok = MobPair.Wire.send(socket, Map.put(hello, "A", MobPair.Wire.b64(a_pub)))
+      {:ok, %{"type" => "challenge", "salt" => salt, "B" => b}} = MobPair.Wire.recv(socket, 5_000)
+      {:ok, salt} = MobPair.Wire.unb64(salt)
+      {:ok, b_pub} = MobPair.Wire.unb64(b)
+
+      :ok = Host.renew(server)
+      assert_receive {:mob_pair_secret, ^server, :open}
+
+      # a correct proof for the old code
+      {:ok, key} = MobPair.Srp.client_key(old, salt, keys, b_pub, "fmutate")
+      {:ok, der} = :ssl.peercert(socket)
+      {:ok, binding} = MobPair.Wire.channel_binding(socket)
+      fp = Cert.fingerprint(der)
+      m1 = MobPair.Srp.client_proof(key, fp, binding, a_pub, b_pub, "fmutate")
+      :ok = MobPair.Wire.send(socket, %{"type" => "proof", "M1" => MobPair.Wire.b64(m1)})
+
+      assert {:ok, %{"type" => "error", "reason" => "expired"}} = MobPair.Wire.recv(socket, 5_000)
+      assert %{status: :open, attempts_left: 5} = Host.info(server)
+      refute_received {:mob_pair_secret, ^server, :used}
+    end
+
+    test "a token is only sent to the host the link pins" do
+      {server, _} = start_server([])
+      {:ok, link} = Link.parse(Host.link(server))
+
+      assert Client.pair(target(server), {:token, link.token}, identity()) ==
+               {:error, :fingerprint_required}
+
+      assert %{status: :open, attempts_left: 5} = Host.info(server)
+    end
+
+    test "a certificate pinned for one node can't be paired under another" do
+      {server, _} = start_server(approve: {:ask, self()})
+      me = identity()
+      spawn(fn -> Client.pair(target(server), {:code, code(server)}, me) end)
+      assert_receive {:mob_pair_request, ^server, ref, %{replaces: nil}}
+      :ok = Host.decide(server, ref, :allow)
+      Process.sleep(100)
+
+      :ok = Host.renew(server)
+      other = %{me | node: "humdinger_other@127.0.0.1"}
+      assert Client.pair(target(server), {:code, code(server)}, other) == {:error, :bad_cert}
+
+      # the same app pairing again under its own name: the sheet says it replaces the pairing
+      :ok = Host.renew(server)
+      spawn(fn -> Client.pair(target(server), {:code, code(server)}, me) end)
+      assert_receive {:mob_pair_request, ^server, ref, %{replaces: %{app_name: "Humdinger"}}}
+      :ok = Host.decide(server, ref, :deny)
+      assert [_one] = Pairings.list()
+    end
+
+    test "a node name too long for an atom is refused before Allow" do
+      {server, _} = start_server([])
+      pairings = Process.whereis(Pairings)
+      long = %{identity() | node: "humdinger@" <> String.duplicate("a", 250)}
+      assert Client.pair(target(server), {:code, code(server)}, long) == {:error, :bad_message}
+      assert Process.whereis(Pairings) == pairings
+      assert Pairings.list() == []
+    end
+
+    test "a name the app reserves is refused" do
+      {server, _} = start_server(reserved: &(&1 == "voice@127.0.0.1"))
+      voice = %{identity() | node: "voice@127.0.0.1"}
+      assert Client.pair(target(server), {:code, code(server)}, voice) == {:error, :bad_node}
+      :ok = Host.renew(server)
+      assert {:ok, _} = Client.pair(target(server), {:code, code(server)}, identity())
+    end
+  end
+
+  defp any_cert,
+    do:
+      [verify: :verify_peer, cacerts: [], verify_fun: Cert.verify_fun(fn _ -> true end)] ++
+        MobPair.Wire.socket_options()
 
   test "the TLS distribution option file (FMutate's private key) is private to its owner" do
     path = Path.join(System.tmp_dir!(), "optfile_#{System.unique_integer([:positive])}.conf")

@@ -67,20 +67,41 @@ rather than changing v1's; JSON keeps both ends free of atoms from the network.
 - **Single-use secret** per open Pair screen: a 40-bit code and a 128-bit token, valid 5 min,
   5 failed attempts (wrong token or wrong SRP proof alike) kill both until New code. A
   successful authentication uses the secret up, whatever the player decides. Tokens and proofs
-  are compared in constant time. At most 8 pairing connections are served at once, and the
-  SRP verifier is computed in the connection's process, not the one holding the secret.
+  are compared in constant time. An SRP proof counts only against the secret it was computed
+  for: New code turns an exchange already under way into `expired`. The SRP verifier is
+  computed in the connection's process, not the one holding the secret. A token is only ever
+  sent to a pinned host (`Client.pair/4` refuses a token without `fp`).
+- **Where the endpoint listens:** loopback (apps on this phone) and the address in the link
+  (Wi-Fi), on one port; never `0.0.0.0`, so mobile data, VPN and tethering never see the
+  pre-auth surface. At most 8 connections before authentication, 2 per source address, 10 s
+  for the TLS handshake, so one peer can't hold every slot. (Anyone who reaches the port can
+  still burn the 5 attempts: New code.) `Front` has the same pre-auth limits, counted apart
+  from its forwarded connections, so a peer without a pinned certificate can't crowd out
+  paired siblings.
 - **SRP-6a** (RFC 5054 2048-bit group, SHA-256 `x`, `K = SHA-256(PAD(S))`): the code is never
   sent; `M1`/`M2` are HMACs over the certificate the joiner saw and the RFC 9266 TLS exporter,
   so a relay that terminates TLS fails the proofs and gets one online guess per attempt.
 - **TLS 1.3 only**, everywhere (pairing, `Front`, `Tunnel`, `-ssl_dist_optfile`).
-- **Allow:** nothing connects without the host player's Allow. Names in the request
-  (`app_name`, `device_name`) are what the joiner claims: control and format characters are
-  stripped, and a host shows a request from another address as "says it is …". A request that
-  would replace an existing pairing under the same node name with another certificate says so.
+- **Allow:** nothing connects without the host player's Allow. Every name in the request
+  (`app_name`, `device_name`, the node) is a claim, from this phone or another: control,
+  format, line/paragraph-separator, private-use and unassigned characters are stripped and
+  spaces collapsed; hosts should word the sheet as "an app … says it is …" either way (another
+  app on the same phone can know the secret too, e.g. from the clipboard). A request that
+  would replace an existing pairing under the same node name says so (whatever its
+  certificate); the host's own name, `<service>_*`, names the app reserves (`:reserved`, e.g.
+  FMutate's same-key siblings) and names over 255 bytes are refused before Allow.
 - **Grant:** a per-peer cookie (32 random bytes, base64url) set for exactly the node name the
   joiner declared (the atom is made only after Allow), and the joiner's own certificate pinned
-  (its key never leaves the joiner). Revoking (Disconnect, or the joiner's `unpair`)
-  disconnects, replaces the cookie with a random one and unpins the certificate.
+  (its key never leaves the joiner; the request doesn't prove possession, so a certificate
+  already pinned for another node is refused: `bad_cert`). A replaced pairing is revoked
+  first.
+- **Revoke** (Disconnect, the joiner's `unpair`, a replacement): the cookie is replaced with a
+  random one first, a handshake of that node already under way is aborted (`net_kernel`'s
+  disconnect leaves pending connections alone, and `dist_util` reads the cookie when it marks
+  the connection pending), the connection is cut and the certificate unpinned; a connection
+  of a revoked name that still comes up (a handshake parked behind a live connection) is
+  dropped at `nodeup`. Revoking can't undo what a connected node already did: distribution is
+  full trust.
 - **Carriers:** plain `inet_tcp` only on loopback (the host's listener bound to 127.0.0.1);
   a joiner on another address is always granted `inet_tls` (mutual TLS 1.3, both certificates
   pinned). `Record.validate/1` and `Transport.connect/2` refuse plain distribution to a
@@ -91,13 +112,17 @@ rather than changing v1's; JSON keeps both ends free of atoms from the network.
   be used under another pairing's name (the cookie check then still applies).
 - **mDNS is unauthenticated:** answers only produce candidates to *try* (pinned TLS + cookie
   decide); a reply is accepted only with one of the query's ids, and records are kept per
-  reply source, so a forged reply is a second candidate, never a replacement.
+  reply source, so a forged reply is a second candidate, never a replacement. A typed code is
+  tried against at most 8 candidates, unicast IPv4 or loopback only.
 - **Atoms:** node names and cookies become atoms only from an approved pairing or a validated
   stored record, never from pairing or mDNS input.
 - **Secrets at rest:** cookies and private keys are hidden from `inspect` (`Record`) and from
-  `:sys.get_status/1` (`Host`), and written 0600 via a temporary file and rename
-  (`Pairings.FileStore`, `-ssl_dist_optfile`). Where the platform has a hardware-backed store,
-  apps should prefer it (`MobPair.Store` / `Pairings.Store` are behaviours for that).
+  `:sys.get_status/1` (`Host`, `Front`: their ssl listen sockets carry the key too), and
+  written 0600 inside a fresh 0700 directory, fsynced, then renamed into place
+  (`Pairings.write_private/2`: `Pairings.FileStore`, `-ssl_dist_optfile`). Where the platform
+  has a hardware-backed store, apps should prefer it (`MobPair.Store` / `Pairings.Store` are
+  behaviours for that). The pairing maps (`Pairings.list/0`, subscriber messages) carry the
+  cookie: don't log them.
 
 ## 5. Node names and addresses
 
@@ -121,6 +146,12 @@ loopback connection under the paired name and checks its cookie. A host booted w
 `-proto_dist inet_tls` and `Pairings.write_ssl_dist_optfile/2` needs no `Front`; joiners
 can't tell the difference.
 
+Cookies, the default cookie and the allow list belong to the running node, so such a host
+starts `MobPair.Pairings` with its other processes and calls
+`MobPair.Pairings.distribution_started/0` once `Node.start/2` returned (and after any
+restart of distribution); until then paired siblings can't connect, which an adopter notices
+at once.
+
 ## 7. Platforms
 
 - **Android:** `ssl`, `public_key`, `crypto` and `asn1` must stay in a release bundle
@@ -143,7 +174,9 @@ can't tell the difference.
 
 - **FMutate** (first host): `FMutate.Pairing` + `FMutate.PairScreen`; `FMutate.Dist` follows
   `MobPair.Pairings` (`default_cookie: :keep, allow_list: false` since `FMutate.Dist` owns
-  the default cookie and admission).
+  the default cookie and admission) and calls `distribution_started/0`; the names
+  `FMutate.Dist` already allowed through the same-key content provider are `:reserved`.
+  Copy link copies `Host.local_link/1` (host 127.0.0.1).
 - **Humdinger** (joiner today, its own copies): replace `Humdinger.FMutate.{Code, PairLink,
   Cert, Wire, Srp, Record, Pairing.Client, Pairing, Discovery, Dns, Epmd, Tunnel, Transport}`
   and `Reference.*` with the package (`service: "fmutate"`); keep `Humdinger.FMutate` (the

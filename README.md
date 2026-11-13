@@ -20,23 +20,28 @@ Pure Elixir/OTP (`ssl`, `public_key`, `crypto`); no native code, no `mob` depend
 # once, with the app's other processes (the store keeps cookies and pinned certificates)
 {MobPair.Pairings, store: {MobPair.Pairings.FileStore, path: Path.join(data_dir, "pairings.json")}}
 
+# a node whose distribution starts at runtime (a Mob app): once Node.start/2 returned
+:ok = MobPair.Pairings.distribution_started()
+
 # while the Pair screen is open
 {:ok, host} =
   MobPair.Host.start_link(
     service: "fmutate",              # link scheme, mDNS type, SRP labels, reserved node prefix
     cert: cert,                      # MobPair.Cert.self_signed("FMutate"), made once and kept
     node: Atom.to_string(node()),
-    host: wifi_ip,                   # the address in the QR code
+    host: wifi_ip,                   # the address in the QR code; listens there and on loopback
     dist_port: tls_port,             # what another phone is granted (always inet_tls)
     loopback_dist: %{port: 9150, proto: :inet_tcp},   # what this phone is granted
     approve: {:ask, self()},         # {:mob_pair_request, host, ref, request} → MobPair.Host.decide/3
+    reserved: &taken_elsewhere?/1,   # node names the app already uses outside the pairings
     notify: self(),                  # {:mob_pair_secret, host, status}
     advertise: []                    # mDNS (_fmutate._tcp), best effort
   )
 
 MobPair.Host.info(host)
-#=> %{code: "KQ7M-X2PD", link: "fmutate://pair?v=1&app=fmutate&inst=a&...", status: :open,
-#     attempts_left: 5, expires_in: 299_000, port: 50_123, advertising: true}
+#=> %{code: "KQ7M-X2PD", link: "fmutate://pair?v=1&app=fmutate&inst=a&...",
+#     local_link: "fmutate://pair?...&host=127.0.0.1&...",   # Copy link, for an app on this phone
+#     status: :open, attempts_left: 5, expires_in: 299_000, port: 50_123, advertising: true}
 ```
 
 A node started at runtime on plain loopback distribution (a Mob app) serves other phones

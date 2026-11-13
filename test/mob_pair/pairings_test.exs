@@ -83,6 +83,21 @@ defmodule MobPair.PairingsTest do
     refute_receive {:mob_pair_pairings, _, _}
   end
 
+  test "a pairing replaced under the same node name is revoked first" do
+    start_supervised!(Pairings)
+    :ok = Pairings.subscribe(self())
+    {:ok, old} = Pairings.add(request("humdinger_a@127.0.0.1"))
+    assert_receive {:mob_pair_pairings, :added, ^old}
+
+    {:ok, new} =
+      Pairings.add(request("humdinger_a@127.0.0.1", %{client_fp: :crypto.hash(:sha256, "new")}))
+
+    assert_receive {:mob_pair_pairings, :revoked, ^old}
+    assert_receive {:mob_pair_pairings, :added, ^new}
+    assert Pairings.node_for_fp(old.client_fp) == nil
+    assert Pairings.list() == [new]
+  end
+
   defp start_pairings_and_add(path, node) do
     start_supervised!({Pairings, store: {FileStore, path: path}})
     Pairings.add(request(node))

@@ -31,8 +31,11 @@ defmodule MobPair.Front do
   certificate unknown here (new connections fail) and the host disconnects
   the node (which closes the forwarded connection).
 
-  At most `:max_connections` (default 8) connections are served at once;
-  each must send its first handshake message within 10 s.
+  At most `:max_connections` (default 8) forwarded connections are served at
+  once. Before that, at most 8 connections may be in their TLS handshake or
+  first message (2 per source address), and each must send its first
+  handshake message within 10 s, so a peer without a pinned certificate
+  can't hold the slots of paired siblings.
   """
 
   use GenServer
@@ -41,6 +44,8 @@ defmodule MobPair.Front do
 
   @handshake_timeout 10_000
   @max_connections 8
+  @max_handshakes 8
+  @max_per_source 2
   @max_handshake_frame 65_535
 
   @doc """
@@ -101,7 +106,8 @@ defmodule MobPair.Front do
          target: Keyword.fetch!(opts, :target),
          node_for_fp: node_for_fp,
          max: Keyword.get(opts, :max_connections, @max_connections),
-         connections: %{}
+         connections: %{},
+         handshakes: %{}
        }}
     else
       {:error, reason} -> {:stop, reason}
@@ -111,26 +117,60 @@ defmodule MobPair.Front do
   @impl true
   def handle_call(:port, _from, state), do: {:reply, state.port, state}
 
-  def handle_call({:admit, pid}, _from, state) do
-    if map_size(state.connections) < state.max do
+  # Before TLS: a bounded number of handshakes, few per source address.
+  def handle_call({:admit, pid, ip}, _from, state) do
+    from_ip = Enum.count(state.handshakes, &match?({_pid, {_ref, ^ip}}, &1))
+
+    if map_size(state.handshakes) < @max_handshakes and from_ip < @max_per_source do
       {:reply, {:ok, state.target, state.node_for_fp},
-       put_in(state.connections[pid], Process.monitor(pid))}
+       put_in(state.handshakes[pid], {Process.monitor(pid), ip})}
     else
       {:reply, :busy, state}
     end
   end
 
+  # The pinned certificate and its name checked: a forwarded connection.
+  def handle_call({:established, pid}, _from, state) do
+    case Map.pop(state.handshakes, pid) do
+      {{ref, _ip}, handshakes} when map_size(state.connections) < state.max ->
+        {:reply, :ok,
+         %{state | handshakes: handshakes, connections: Map.put(state.connections, pid, ref)}}
+
+      _ ->
+        {:reply, :busy, state}
+    end
+  end
+
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state),
-    do: {:noreply, %{state | connections: Map.delete(state.connections, pid)}}
+    do:
+      {:noreply,
+       %{
+         state
+         | connections: Map.delete(state.connections, pid),
+           handshakes: Map.delete(state.handshakes, pid)
+       }}
 
   def handle_info({:EXIT, pid, reason}, %{acceptor: pid} = state), do: {:stop, reason, state}
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
+  # The ssl listen socket's options hold the host's private key: keep it out
+  # of crash reports and :sys.get_status/1.
+  @impl true
+  def format_status(status) do
+    Map.update(status, :state, nil, fn
+      %{listen: _} = state -> %{state | listen: :redacted}
+      other -> other
+    end)
+  end
+
   @impl true
   def terminate(_reason, state) do
     :ssl.close(state.listen)
-    for {pid, _ref} <- state.connections, do: Process.exit(pid, :shutdown)
+
+    for {pid, _} <- Map.merge(state.connections, state.handshakes),
+        do: Process.exit(pid, :shutdown)
+
     :ok
   end
 
@@ -158,11 +198,12 @@ defmodule MobPair.Front do
   defp serve(server, transport_socket) do
     Process.monitor(server)
 
-    with {:ok, target, node_for_fp} <- admit(server),
+    with {:ok, target, node_for_fp} <- admit(server, transport_socket),
          {:ok, tls} <- :ssl.handshake(transport_socket, @handshake_timeout),
          {:ok, expected} <- paired_node(tls, node_for_fp),
          {:ok, first, rest} <- first_message(tls),
          :ok <- same_name(first, expected),
+         :ok <- GenServer.call(server, {:established, self()}),
          {:ok, tcp} <- connect(target) do
       :ok = :gen_tcp.send(tcp, <<byte_size(first)::16, first::binary>>)
       to_node = after_message(first, ?r)
@@ -175,10 +216,12 @@ defmodule MobPair.Front do
     end
   end
 
-  defp admit(server) do
-    case GenServer.call(server, {:admit, self()}) do
-      {:ok, target, node_for_fp} -> {:ok, target, node_for_fp}
-      :busy -> {:error, :busy}
+  defp admit(server, transport_socket) do
+    with {:ok, {ip, _port}} <- :ssl.peername(transport_socket),
+         {:ok, target, node_for_fp} <- GenServer.call(server, {:admit, self(), ip}) do
+      {:ok, target, node_for_fp}
+    else
+      _busy_or_gone -> {:error, :busy}
     end
   end
 

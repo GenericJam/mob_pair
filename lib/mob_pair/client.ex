@@ -38,6 +38,7 @@ defmodule MobPair.Client do
     "no_such_instance" => :no_such_instance,
     "loopback_only" => :loopback_only,
     "bad_node" => :bad_node,
+    "bad_cert" => :bad_cert,
     "not_pairing" => :not_pairing,
     "busy" => :busy,
     "expired" => :expired,
@@ -55,15 +56,22 @@ defmodule MobPair.Client do
 
   Errors: `:unreachable`, `:fingerprint_mismatch` (the certificate isn't the
   link's, or the host's SRP proof doesn't cover the certificate seen),
+  `:fingerprint_required` (a token is only ever sent to a pinned host),
   `{:wrong_code, attempts_left}`, `:too_many_attempts`, `:expired`,
   `:invalid_token`, `:not_pairing`, `:busy`, `:denied`, `:timeout`,
   `:loopback_only` (that host has no TLS distribution, so it pairs only
-  apps on its own phone), `:bad_node`,
+  apps on its own phone), `:bad_node`, `:bad_cert` (the identity's
+  certificate is pinned for another node there),
   `:no_such_instance`, `:unsupported_version`, `{:protocol, detail}`.
   """
   @spec pair(target(), auth(), identity(), (atom() -> any())) ::
           {:ok, Record.t()} | {:error, term()}
-  def pair(target, auth, identity, notify \\ fn _ -> :ok end) do
+  def pair(target, auth, identity, notify \\ fn _ -> :ok end)
+
+  # The token is a bearer secret: without the link's fp any listener could take it.
+  def pair(%{fp: nil}, {:token, _token}, _identity, _notify), do: {:error, :fingerprint_required}
+
+  def pair(target, auth, identity, notify) do
     with {:ok, socket} <- connect(target) do
       try do
         exchange(socket, target, auth, identity, notify)

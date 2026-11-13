@@ -22,13 +22,16 @@ defmodule MobPair.Host do
   can't start (on Android the system owns port 5353) it runs on without
   mDNS and logs a warning (`info/1`'s `advertising` is false).
 
-  Stopping the server stops pairing and advertising. Siblings that connect
+  Stopping the server stops pairing and advertising. It listens on
+  loopback and on the link's address only (not on every interface: mobile
+  data, VPN and tethering never see it). Siblings that connect
   from loopback are granted `127.0.0.1` and `:loopback_dist`; others get
   `:dist_host`, `:dist_port` and always `inet_tls`. With
   `dist_proto: :inet_tcp` (the host's plain listener on loopback, see
   `MobPair.boot_args/1`) only siblings on the same phone can pair: others
   get `loopback_only` before they spend an attempt, and a non-loopback
-  `:dist_host` refuses to start. At most 8 connections are handled at once.
+  `:dist_host` refuses to start. At most 8 connections are handled at once,
+  2 per source address, and each must finish its TLS handshake within 10 s.
 
   The approval hook is `:approve`: a function of the request returning
   `:allow` or `:deny` (it runs in the connection's process and may block), or
@@ -37,11 +40,14 @@ defmodule MobPair.Host do
   `decide(server, ref, :allow | :deny)`; if the sibling hangs up first,
   `pid` gets `{:mob_pair_withdrawn, server, ref}`. The request is
   `%{app_id, app_name, device_name, node, client_fp, remote_ip, replaces}`:
-  the names are what the sibling says (control and format characters
-  removed; a sibling on another phone can claim any name), and `replaces` is
+  the names are what the sibling says (control, format and line-separator
+  characters removed, runs of spaces collapsed; any sibling, on this phone
+  or another, can claim any name), and `replaces` is
   `%{app_name, device_name, paired_at}` of an existing pairing under the same
-  node name with another certificate (Allow replaces it), else nil. The
-  host's own node name and any `<service>_*` name are refused (`bad_node`).
+  node name (Allow replaces it and drops its connection), else nil. The
+  host's own node name, any `<service>_*` name, any name `:reserved` says
+  is taken, and a client certificate already pinned for another node are
+  refused (`bad_node`, `bad_cert`).
   """
 
   use GenServer
@@ -52,9 +58,11 @@ defmodule MobPair.Host do
 
   @ttl 300_000
   @max_attempts 5
+  @handshake_timeout 10_000
   @step_timeout 30_000
   @decision_timeout 120_000
   @max_handshakes 8
+  @max_per_source 2
 
   @doc """
   Options: `:service` (the host's service name, required), `:cert` (the
@@ -64,12 +72,15 @@ defmodule MobPair.Host do
   to siblings on the same phone, default `%{port: dist_port, proto:
   dist_proto}`), `:inst` (`"a"`), `:name` (`"<Service> <INST>"`), `:device`,
   `:firmware` (the detail line siblings show), `:node` (the host's node
-  name, default `node()`), `:ip` / `:port` to listen on (`{0, 0, 0, 0}`, 0),
-  `:host` (the address put in the link; default the first non-loopback IPv4
-  address), `:ttl` (ms), `:max_attempts`, `:approve`, `:notify` (a pid),
-  `:pairings` (a module with `add/1` and `get/1`, default
-  `MobPair.Pairings`), `:advertise` (Responder options such as `:bind`, or
-  `false`), `:server_name`.
+  name, default `node()`), `:ip` (an address or a list of them to listen on;
+  default 127.0.0.1 and `:host`), `:port` (default 0: any, the same on every
+  address), `:host` (the address put in the link; default the first
+  non-loopback IPv4 address), `:ttl` (ms), `:max_attempts`, `:approve`,
+  `:reserved` (a function of a requested node name, true when something
+  outside `:pairings` already uses it: refused with `bad_node`), `:notify`
+  (a pid), `:pairings` (a module with `add/1`, `get/1` and `node_for_fp/1`,
+  default `MobPair.Pairings`), `:advertise` (Responder options such as
+  `:bind`, or `false`), `:server_name`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -87,6 +98,13 @@ defmodule MobPair.Host do
   @spec link(GenServer.server()) :: String.t()
   def link(server), do: GenServer.call(server, :link)
 
+  @doc """
+  The same link with host `127.0.0.1`: what Copy link should give an app on
+  this phone (it then pairs over loopback whatever the Wi-Fi does).
+  """
+  @spec local_link(GenServer.server()) :: String.t()
+  def local_link(server), do: GenServer.call(server, :local_link)
+
   @doc "The pairing port."
   @spec port(GenServer.server()) :: :inet.port_number()
   def port(server), do: GenServer.call(server, :port)
@@ -95,6 +113,7 @@ defmodule MobPair.Host do
   @type info :: %{
           code: String.t(),
           link: String.t(),
+          local_link: String.t(),
           port: :inet.port_number(),
           status: :open | :used | :invalid | :expired,
           attempts_left: non_neg_integer(),
@@ -103,7 +122,8 @@ defmodule MobPair.Host do
         }
 
   @doc """
-  The secret's state for the Pair screen: the code and link to show, the
+  The secret's state for the Pair screen: the code and link to show (and
+  `local_link`, see `local_link/1`), the
   status (`:open`, `:used` once a sibling got in, `:invalid` after too many
   failed attempts, `:expired`), the attempts left, the ms until it expires
   (0 when expired), and whether mDNS advertising runs.
@@ -163,16 +183,44 @@ defmodule MobPair.Host do
     {:ok, _} = Application.ensure_all_started(:ssl)
 
     listen_options =
-      [
-        certs_keys: [Cert.ssl_cert_key(cert.cert, cert.key)],
-        ip: Keyword.get(opts, :ip, {0, 0, 0, 0}),
-        reuseaddr: true
-      ] ++ Wire.socket_options()
+      [certs_keys: [Cert.ssl_cert_key(cert.cert, cert.key)], reuseaddr: true] ++
+        Wire.socket_options()
 
-    {:ok, listen} = :ssl.listen(Keyword.get(opts, :port, 0), listen_options)
-    {:ok, {_, port}} = :ssl.sockname(listen)
+    ips = opts |> Keyword.get_lazy(:ip, fn -> default_ips(host) end) |> List.wrap()
+
+    case listen(ips, Keyword.get(opts, :port, 0), listen_options, []) do
+      {:ok, listens, port} -> started(opts, cert, host, listens, port)
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  # Loopback (apps on this phone) and the address in the link (other phones).
+  defp default_ips(host) do
+    case :inet.parse_strict_address(String.to_charlist(host)) do
+      {:ok, {127, _, _, _}} -> [{127, 0, 0, 1}]
+      {:ok, {_, _, _, _} = ip} -> [{127, 0, 0, 1}, ip]
+      _ -> [{127, 0, 0, 1}]
+    end
+  end
+
+  # The first address picks the port (unless given); the others listen on it too.
+  defp listen([], port, _options, listens), do: {:ok, Enum.reverse(listens), port}
+
+  defp listen([ip | ips], port, options, listens) do
+    case :ssl.listen(port, [ip: ip] ++ options) do
+      {:ok, listen} ->
+        {:ok, {_, port}} = :ssl.sockname(listen)
+        listen(ips, port, options, [listen | listens])
+
+      {:error, reason} ->
+        Enum.each(listens, &:ssl.close/1)
+        {:error, {:listen, ip, reason}}
+    end
+  end
+
+  defp started(opts, cert, host, listens, port) do
     server = self()
-    acceptor = spawn_link(fn -> accept_loop(server, listen) end)
+    for listen <- listens, do: spawn_link(fn -> accept_loop(server, listen) end)
 
     service = Keyword.fetch!(opts, :service)
     inst = Keyword.get(opts, :inst, "a")
@@ -196,13 +244,13 @@ defmodule MobPair.Host do
       loopback_port: Map.get(loopback, :port, dist_port),
       loopback_proto: Map.get(loopback, :proto, dist_proto),
       approve: Keyword.get(opts, :approve, fn _request -> :deny end),
+      reserved: Keyword.get(opts, :reserved, fn _node -> false end),
       pairings: Keyword.get(opts, :pairings, MobPair.Pairings)
     }
 
     state = %{
       config: config,
-      listen: listen,
-      acceptor: acceptor,
+      listens: listens,
       ttl: Keyword.get(opts, :ttl, @ttl),
       max_attempts: Keyword.get(opts, :max_attempts, @max_attempts),
       secret: nil,
@@ -220,6 +268,7 @@ defmodule MobPair.Host do
   def handle_call(:code, _from, state), do: {:reply, Code.format(state.secret.code), state}
 
   def handle_call(:link, _from, state), do: {:reply, build_link(state), state}
+  def handle_call(:local_link, _from, state), do: {:reply, build_link(state, "127.0.0.1"), state}
 
   def handle_call(:info, _from, %{secret: secret} = state) do
     left = max(secret.expires_at - System.monotonic_time(:millisecond), 0)
@@ -227,6 +276,7 @@ defmodule MobPair.Host do
     info = %{
       code: Code.format(secret.code),
       link: build_link(state),
+      local_link: build_link(state, "127.0.0.1"),
       port: state.config.port,
       status: if(secret.status == :open and left == 0, do: :expired, else: secret.status),
       attempts_left: max(state.max_attempts - secret.attempts, 0),
@@ -255,26 +305,35 @@ defmodule MobPair.Host do
   end
 
   # The verifier (a 2048-bit modpow) is computed by the connection, not here.
+  # The proof is checked against the secret it was computed for: New code
+  # in between makes it `expired`, whatever the proof.
   def handle_call(:srp_code, _from, state) do
     case usable(state) do
       :ok ->
-        {:reply, {:ok, state.secret.code}, state}
+        {:reply, {:ok, state.secret.code, state.secret.id}, state}
 
       error ->
         {:reply, error, state}
     end
   end
 
-  def handle_call({:srp_result, proof_ok?}, _from, state) do
+  def handle_call({:srp_result, id, proof_ok?}, _from, %{secret: %{id: id}} = state) do
     case usable(state) do
       :ok -> if proof_ok?, do: {:reply, :ok, consume(state)}, else: failed(state, "wrong_code")
       error -> {:reply, error, state}
     end
   end
 
-  def handle_call({:admit, handler}, _from, state) do
-    if map_size(state.handshakes) < @max_handshakes,
-      do: {:reply, :ok, put_in(state.handshakes[Process.monitor(handler)], handler)},
+  def handle_call({:srp_result, _old, _proof_ok?}, _from, state),
+    do: {:reply, {:error, "expired"}, state}
+
+  # Before the TLS handshake: at most @max_handshakes connections, and
+  # @max_per_source from one address, so one peer can't hold every slot.
+  def handle_call({:admit, handler, ip}, _from, state) do
+    from_ip = Enum.count(state.handshakes, &match?({_ref, {_, ^ip}}, &1))
+
+    if map_size(state.handshakes) < @max_handshakes and from_ip < @max_per_source,
+      do: {:reply, :ok, put_in(state.handshakes[Process.monitor(handler)], {handler, ip})},
       else: {:reply, :busy, state}
   end
 
@@ -303,12 +362,18 @@ defmodule MobPair.Host do
   # A responder that failed to start (see start_responder/1).
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
-  # The code and token stay out of crash reports and :sys.get_status/1.
+  # The code, the token and the host's private key (also inside the ssl
+  # listen sockets' options) stay out of crash reports and :sys.get_status/1.
   @impl true
   def format_status(status) do
     Map.update(status, :state, nil, fn
-      %{secret: %{} = secret} = state ->
-        %{state | secret: %{secret | code: :redacted, token: :redacted}}
+      %{secret: %{} = secret, config: %{cert: cert} = config} = state ->
+        %{
+          state
+          | secret: %{secret | code: :redacted, token: :redacted},
+            config: %{config | cert: %{cert | key: :redacted}},
+            listens: :redacted
+        }
 
       other ->
         other
@@ -317,16 +382,16 @@ defmodule MobPair.Host do
 
   @impl true
   def terminate(_reason, state) do
-    :ssl.close(state.listen)
+    Enum.each(state.listens, &:ssl.close/1)
     if state.responder, do: Responder.stop(state.responder)
   end
 
-  defp build_link(%{config: c} = state) do
+  defp build_link(%{config: c} = state, host \\ nil) do
     Link.build(%{
       service: c.service,
       inst: c.inst,
       node: short_name(c.node),
-      host: c.host,
+      host: host || c.host,
       port: c.port,
       fp: c.cert.fp,
       token: state.secret.token
@@ -338,6 +403,7 @@ defmodule MobPair.Host do
   # The secret: usable while open and unexpired.
   defp new_secret(state) do
     %{
+      id: make_ref(),
       code: Code.generate(),
       token: :crypto.strong_rand_bytes(16),
       expires_at: System.monotonic_time(:millisecond) + state.ttl,
@@ -457,10 +523,11 @@ defmodule MobPair.Host do
   end
 
   # One sibling's exchange, in its own process; at most @max_handshakes at a
-  # time, so a peer on the Wi-Fi can't exhaust processes or CPU.
+  # time (@max_per_source from one address), so a peer on the Wi-Fi can't
+  # exhaust processes or CPU, or hold every slot by itself.
   defp handle_connection(server, transport_socket) do
     with :ok <- admit(server, transport_socket),
-         {:ok, socket} <- :ssl.handshake(transport_socket, @step_timeout) do
+         {:ok, socket} <- :ssl.handshake(transport_socket, @handshake_timeout) do
       config = GenServer.call(server, :config)
 
       case exchange(server, socket, config) do
@@ -473,11 +540,11 @@ defmodule MobPair.Host do
   end
 
   defp admit(server, transport_socket) do
-    case GenServer.call(server, {:admit, self()}) do
-      :ok ->
-        :ok
-
-      :busy ->
+    with {:ok, {ip, _port}} <- :ssl.peername(transport_socket),
+         :ok <- GenServer.call(server, {:admit, self(), ip}) do
+      :ok
+    else
+      _busy_or_gone ->
         :ssl.close(transport_socket)
         :busy
     end
@@ -530,7 +597,7 @@ defmodule MobPair.Host do
   defp authenticate(server, socket, config, %{"auth" => "srp", "A" => a}) do
     with {:ok, a_pub} <- decode(a, max: 256),
          true <- Srp.valid_public?(a_pub) || {:error, Wire.error("bad_message")},
-         {:ok, code} <- secret_call(server, :srp_code),
+         {:ok, code, secret_id} <- secret_call(server, :srp_code),
          salt = Srp.salt(),
          verifier = Srp.verifier(code, salt, config.service),
          {b_pub, _} = keys = Srp.server_keys(verifier),
@@ -545,7 +612,7 @@ defmodule MobPair.Host do
          {:ok, key} <- Srp.server_key(verifier, a_pub, keys),
          {:ok, binding} <- Wire.channel_binding(socket),
          expected = Srp.client_proof(key, config.cert.fp, binding, a_pub, b_pub, config.service),
-         :ok <- secret_call(server, {:srp_result, Srp.same?(m1, expected)}) do
+         :ok <- secret_call(server, {:srp_result, secret_id, Srp.same?(m1, expected)}) do
       m2 = Srp.server_proof(key, config.cert.fp, binding, a_pub, b_pub, m1, config.service)
       Wire.send(socket, %{"type" => "welcome", "M2" => Wire.b64(m2)})
     else
@@ -576,9 +643,9 @@ defmodule MobPair.Host do
          {:ok, device_name} <- text(m["device_name"], 0, 100),
          true <- Record.self_node?(m["node"]),
          :ok <- sibling_node(m["node"], config),
-         {:ok, cert} <- decode(m["client_cert"], max: 4096) do
-      client_fp = Cert.fingerprint(cert)
-
+         {:ok, cert} <- decode(m["client_cert"], max: 4096),
+         client_fp = Cert.fingerprint(cert),
+         :ok <- own_cert(config.pairings, m["node"], client_fp) do
       {:ok,
        %{
          app_id: app_id,
@@ -586,7 +653,7 @@ defmodule MobPair.Host do
          device_name: device_name,
          node: m["node"],
          client_fp: client_fp,
-         replaces: replaces(config.pairings, m["node"], client_fp)
+         replaces: replaces(config.pairings, m["node"])
        }}
     else
       {:error, _} = error -> error
@@ -595,18 +662,29 @@ defmodule MobPair.Host do
   end
 
   # A sibling can't take the host's own name (its cookie would become the
-  # host's default cookie) or any instance's of the host's service.
+  # host's default cookie), any instance's of the host's service, or a name
+  # the app says is taken outside the pairings (e.g. FMutate's same-key
+  # siblings).
   defp sibling_node(node, config) do
-    if node == config.node or String.starts_with?(node, config.service <> "_"),
-      do: {:error, Wire.error("bad_node")},
-      else: :ok
+    if node == config.node or String.starts_with?(node, config.service <> "_") or
+         config.reserved.(node) == true,
+       do: {:error, Wire.error("bad_node")},
+       else: :ok
   end
 
-  # Another app already paired under this node name with another
-  # certificate: the Allow sheet must say it would be replaced.
-  defp replaces(pairings, node, client_fp) do
+  # The request's certificate isn't proven (the joiner's key never leaves
+  # it): one already pinned for another node is refused, so a pairing can't
+  # make another pairing's certificate resolve to its own name at the Front.
+  defp own_cert(pairings, node, client_fp) do
+    if pairings.node_for_fp(client_fp) in [nil, node],
+      do: :ok,
+      else: {:error, Wire.error("bad_cert")}
+  end
+
+  # Another app already paired under this node name (whatever its
+  # certificate): the Allow sheet must say it would be replaced.
+  defp replaces(pairings, node) do
     case pairings.get(node) do
-      %{client_fp: ^client_fp} -> nil
       %{} = old -> Map.take(old, [:app_name, :device_name, :paired_at])
       nil -> nil
     end
@@ -682,11 +760,15 @@ defmodule MobPair.Host do
     end
   end
 
-  # Text for the Allow sheet: control and format characters (newlines, bidi
-  # overrides) removed, then the length checked.
+  # Text for the Allow sheet: control, format, line/paragraph separator,
+  # private-use and unassigned characters (newlines, bidi overrides, U+2028)
+  # removed and runs of spaces collapsed, then the length checked.
   defp text(value, min, max) when is_binary(value) do
     with true <- String.valid?(value),
-         clean = String.replace(value, ~r/[\p{Cc}\p{Cf}]/u, ""),
+         clean =
+           value
+           |> String.replace(~r/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/u, "")
+           |> String.replace(~r/\p{Zs}+/u, " "),
          true <- String.length(clean) in min..max do
       {:ok, clean}
     else
