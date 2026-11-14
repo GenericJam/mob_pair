@@ -18,20 +18,30 @@ defmodule MobPair.Host do
   identity), asks the user (`:approve`), and on Allow registers the sibling
   with `:pairings` (`MobPair.Pairings`) and returns the grant. With
   `:advertise` it also announces itself over mDNS (`MobPair.Responder`,
-  `_<service>._tcp.local`) with the TXT keys of §1.5; when the responder
-  can't start (on Android the system owns port 5353) it runs on without
-  mDNS and logs a warning (`info/1`'s `advertising` is false).
+  `_<service>._tcp.local`, on the link's interface only) with the TXT keys
+  of §1.5; when the responder can't start (on Android the system owns port
+  5353) or stops later, it runs on without mDNS and logs a warning
+  (`info/1`'s `advertising` is false).
 
-  Stopping the server stops pairing and advertising. It listens on
-  loopback and on the link's address only (not on every interface: mobile
-  data, VPN and tethering never see it). Siblings that connect
-  from loopback are granted `127.0.0.1` and `:loopback_dist`; others get
-  `:dist_host`, `:dist_port` and always `inet_tls`. With
+  Stopping the server stops pairing and advertising, and closes every
+  connection in progress (a request waiting for Allow is withdrawn). It
+  listens on loopback and on the link's address only (not on every
+  interface: mobile data, VPN and tethering never see it). Siblings that
+  connect from loopback are granted `127.0.0.1` and `:loopback_dist`; others
+  get `:dist_host`, `:dist_port` and always `inet_tls`. With
   `dist_proto: :inet_tcp` (the host's plain listener on loopback, see
   `MobPair.boot_args/1`) only siblings on the same phone can pair: others
   get `loopback_only` before they spend an attempt, and a non-loopback
-  `:dist_host` refuses to start. At most 8 connections are handled at once,
-  2 per source address, and each must finish its TLS handshake within 10 s.
+  `:dist_host` refuses to start.
+
+  Admission: new connections are rate limited (`:accept_rate`, default 40
+  at once then one per 100 ms; `:accept_rate_per_source`, default 10 at
+  once then one per second from one address), at most 8 are handled at
+  once, 2 per source address, and each must finish its TLS handshake within
+  10 s; a connection over a limit is closed by the accept loop before
+  anything is spawned for it. An SRP challenge the sibling leaves without
+  sending its proof counts as a failed attempt, so connecting, sending `A`
+  and hanging up can't make the host compute verifiers forever.
 
   The approval hook is `:approve`: a function of the request returning
   `:allow` or `:deny` (it runs in the connection's process and may block), or
@@ -63,6 +73,8 @@ defmodule MobPair.Host do
   @decision_timeout 120_000
   @max_handshakes 8
   @max_per_source 2
+  @accept_rate {40, 100}
+  @accept_rate_per_source {10, 1_000}
 
   @doc """
   Options: `:service` (the host's service name, required), `:cert` (the
@@ -81,7 +93,9 @@ defmodule MobPair.Host do
   outside `:pairings` already uses it: refused with `bad_node`), `:notify`
   (a pid), `:pairings` (a module with `add/1`, `get/1` and `node_for_fp/1`,
   default `MobPair.Pairings`), `:advertise` (Responder options such as
-  `:bind`, or `false`), `:server_name`.
+  `:bind`, or `false`; `:interface` defaults to `:host`), `:accept_rate`
+  and `:accept_rate_per_source` (`{burst, interval_ms}`, see above),
+  `:server_name`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -147,6 +161,9 @@ defmodule MobPair.Host do
 
   @impl true
   def init(opts) do
+    # Connections and the optional responder are linked; their exits are
+    # handled (handle_info/2), and terminate/2 runs on shutdown.
+    Process.flag(:trap_exit, true)
     cert = Keyword.fetch!(opts, :cert)
     host = Keyword.get_lazy(opts, :host, &default_host/0)
     dist_proto = Keyword.get(opts, :dist_proto, :inet_tls)
@@ -180,13 +197,11 @@ defmodule MobPair.Host do
     end
   end
 
+  # The listeners are plain TCP: a connection is admitted (or closed) before
+  # any TLS work, and TLS starts on it in its own process (handle_connection/3).
   defp start(opts, cert, host) do
     {:ok, _} = Application.ensure_all_started(:ssl)
-
-    listen_options =
-      [certs_keys: [Cert.ssl_cert_key(cert.cert, cert.key)], reuseaddr: true] ++
-        Wire.socket_options()
-
+    listen_options = [:binary, active: false, packet: :raw, reuseaddr: true]
     ips = opts |> Keyword.get_lazy(:ip, fn -> default_ips(host) end) |> List.wrap()
 
     case listen(ips, Keyword.get(opts, :port, 0), listen_options, []) do
@@ -208,20 +223,20 @@ defmodule MobPair.Host do
   defp listen([], port, _options, listens), do: {:ok, Enum.reverse(listens), port}
 
   defp listen([ip | ips], port, options, listens) do
-    case :ssl.listen(port, [ip: ip] ++ options) do
+    case :gen_tcp.listen(port, [ip: ip] ++ options) do
       {:ok, listen} ->
-        {:ok, {_, port}} = :ssl.sockname(listen)
+        {:ok, port} = :inet.port(listen)
         listen(ips, port, options, [listen | listens])
 
       {:error, reason} ->
-        Enum.each(listens, &:ssl.close/1)
+        Enum.each(listens, &:gen_tcp.close/1)
         {:error, {:listen, ip, reason}}
     end
   end
 
   defp started(opts, cert, host, listens, port) do
     server = self()
-    for listen <- listens, do: spawn_link(fn -> accept_loop(server, listen) end)
+    acceptors = for listen <- listens, do: spawn_link(fn -> accept_loop(server, listen) end)
 
     service = Keyword.fetch!(opts, :service)
     inst = Keyword.get(opts, :inst, "a")
@@ -252,12 +267,19 @@ defmodule MobPair.Host do
     state = %{
       config: config,
       listens: listens,
+      acceptors: acceptors,
       ttl: Keyword.get(opts, :ttl, @ttl),
       max_attempts: Keyword.get(opts, :max_attempts, @max_attempts),
       secret: nil,
       notify: Keyword.get(opts, :notify),
+      admission:
+        MobPair.Admission.new(
+          Keyword.get(opts, :accept_rate, @accept_rate),
+          Keyword.get(opts, :accept_rate_per_source, @accept_rate_per_source)
+        ),
       asks: %{},
-      handshakes: %{},
+      handlers: %{},
+      challenges: %{},
       responder: nil
     }
 
@@ -307,35 +329,56 @@ defmodule MobPair.Host do
 
   # The verifier (a 2048-bit modpow) is computed by the connection, not here.
   # The proof is checked against the secret it was computed for: New code
-  # in between makes it `expired`, whatever the proof.
-  def handle_call(:srp_code, _from, state) do
+  # in between makes it `expired`, whatever the proof. A challenge whose
+  # connection ends before its proof counts as a failed attempt (see
+  # abandoned/2).
+  def handle_call(:srp_code, {handler, _}, state) do
     case usable(state) do
       :ok ->
-        {:reply, {:ok, state.secret.code, state.secret.id}, state}
+        {:reply, {:ok, state.secret.code, state.secret.id},
+         put_in(state.challenges[handler], state.secret.id)}
 
       error ->
         {:reply, error, state}
     end
   end
 
-  def handle_call({:srp_result, id, proof_ok?}, _from, %{secret: %{id: id}} = state) do
+  def handle_call({:srp_result, id, proof_ok?}, {handler, _}, %{secret: %{id: id}} = state) do
+    state = %{state | challenges: Map.delete(state.challenges, handler)}
+
     case usable(state) do
       :ok -> if proof_ok?, do: {:reply, :ok, consume(state)}, else: failed(state, "wrong_code")
       error -> {:reply, error, state}
     end
   end
 
-  def handle_call({:srp_result, _old, _proof_ok?}, _from, state),
-    do: {:reply, {:error, "expired"}, state}
+  def handle_call({:srp_result, _old, _proof_ok?}, {handler, _}, state),
+    do:
+      {:reply, {:error, "expired"}, %{state | challenges: Map.delete(state.challenges, handler)}}
 
-  # Before the TLS handshake: at most @max_handshakes connections, and
-  # @max_per_source from one address, so one peer can't hold every slot.
-  def handle_call({:admit, handler, ip}, _from, state) do
-    from_ip = Enum.count(state.handshakes, &match?({_ref, {_, ^ip}}, &1))
+  # From the accept loop, before anything runs for the connection: the
+  # connection rate (globally and from this address), then at most
+  # @max_handshakes connections at once and @max_per_source from one
+  # address, so one peer can't hold every slot. Admitted, the connection gets
+  # its own process, linked (it dies with the server) and monitored.
+  def handle_call({:admit, ip}, _from, state) do
+    from_ip = Enum.count(state.handlers, &match?({_pid, {_ref, ^ip}}, &1))
 
-    if map_size(state.handshakes) < @max_handshakes and from_ip < @max_per_source,
-      do: {:reply, :ok, put_in(state.handshakes[Process.monitor(handler)], {handler, ip})},
-      else: {:reply, :busy, state}
+    with true <- map_size(state.handlers) < @max_handshakes and from_ip < @max_per_source,
+         {:ok, admission} <- MobPair.Admission.take(state.admission, ip) do
+      %{config: %{cert: cert}} = state
+      server = self()
+
+      handler =
+        spawn_link(fn ->
+          receive(do: ({:go, socket} -> handle_connection(server, socket, cert)))
+        end)
+
+      handlers = Map.put(state.handlers, handler, {Process.monitor(handler), ip})
+      {:reply, {:ok, handler}, %{state | admission: admission, handlers: handlers}}
+    else
+      _ -> {:reply, :busy, state}
+    end
   end
 
   def handle_call({:ask, request}, {handler, _}, %{config: %{approve: {:ask, pid}}} = state) do
@@ -350,21 +393,35 @@ defmodule MobPair.Host do
     {:reply, :ok, %{state | asks: asks}}
   end
 
-  def handle_call({:withdraw, ref}, _from, %{config: %{approve: {:ask, pid}}} = state) do
-    {handler, asks} = Map.pop(state.asks, ref)
-    if handler, do: send(pid, {:mob_pair_withdrawn, self(), ref})
-    {:reply, :ok, %{state | asks: asks}}
+  # A connection ended, however: its request (if any) is withdrawn and an
+  # SRP challenge it left unanswered is a failed attempt.
+  @impl true
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state)
+      when is_map_key(state.handlers, pid) do
+    {secret_id, challenges} = Map.pop(state.challenges, pid)
+
+    state =
+      %{state | handlers: Map.delete(state.handlers, pid), challenges: challenges}
+      |> withdraw(pid)
+      |> abandoned(secret_id)
+
+    {:noreply, state}
   end
 
-  @impl true
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, state),
-    do: {:noreply, %{state | handshakes: Map.delete(state.handshakes, ref)}}
+  def handle_info({:EXIT, pid, reason}, %{responder: pid} = state) do
+    Logger.warning("MobPair.Host: mDNS responder stopped, not advertising: #{inspect(reason)}")
+    {:noreply, %{state | responder: nil}}
+  end
 
-  # A responder that failed to start (see start_responder/1).
-  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+  def handle_info({:EXIT, pid, reason}, state) when reason != :normal do
+    if pid in state.acceptors, do: {:stop, reason, state}, else: {:noreply, state}
+  end
 
-  # The code, the token and the host's private key (also inside the ssl
-  # listen sockets' options) stay out of crash reports and :sys.get_status/1.
+  # Connections (see their :DOWN), a responder that failed to start, ports.
+  def handle_info(_message, state), do: {:noreply, state}
+
+  # The code, the token and the host's private key stay out of crash reports
+  # and :sys.get_status/1.
   @impl true
   def format_status(status) do
     Map.update(status, :state, nil, fn
@@ -372,8 +429,7 @@ defmodule MobPair.Host do
         %{
           state
           | secret: %{secret | code: :redacted, token: :redacted},
-            config: %{config | cert: %{cert | key: :redacted}},
-            listens: :redacted
+            config: %{config | cert: %{cert | key: :redacted}}
         }
 
       other ->
@@ -381,11 +437,41 @@ defmodule MobPair.Host do
     end)
   end
 
+  # Every connection in progress closes with the server (its socket closes
+  # with its process) and its request is withdrawn.
   @impl true
   def terminate(_reason, state) do
-    Enum.each(state.listens, &:ssl.close/1)
-    if state.responder, do: Responder.stop(state.responder)
+    Enum.each(state.listens, &:gen_tcp.close/1)
+
+    for {pid, _} <- state.handlers do
+      Process.exit(pid, :kill)
+      withdraw(state, pid)
+    end
+
+    if state.responder, do: stop_responder(state.responder)
   end
+
+  defp stop_responder(responder) do
+    Responder.stop(responder)
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp withdraw(%{config: %{approve: {:ask, owner}}} = state, handler) do
+    {gone, asks} = Map.split_with(state.asks, fn {_ref, pid} -> pid == handler end)
+    for {ref, _} <- gone, do: send(owner, {:mob_pair_withdrawn, self(), ref})
+    %{state | asks: asks}
+  end
+
+  defp withdraw(state, _handler), do: state
+
+  # An SRP challenge left without a proof: an attempt at the secret it was
+  # issued for, while that secret is still the one in use.
+  defp abandoned(%{secret: %{id: id}} = state, id) do
+    if usable(state) == :ok, do: elem(attempt_failed(state), 1), else: state
+  end
+
+  defp abandoned(state, _secret_id), do: state
 
   defp build_link(%{config: c} = state, host \\ nil) do
     Link.build(%{
@@ -430,6 +516,19 @@ defmodule MobPair.Host do
   defp consume(state), do: changed(put_in(state.secret.status, :used))
 
   defp failed(state, reason) do
+    {left, state} = attempt_failed(state)
+
+    reply =
+      cond do
+        left <= 0 -> {:error, "too_many_attempts"}
+        reason == "wrong_code" -> {:error, "wrong_code", left}
+        true -> {:error, reason}
+      end
+
+    {:reply, reply, state}
+  end
+
+  defp attempt_failed(state) do
     attempts = state.secret.attempts + 1
     left = state.max_attempts - attempts
 
@@ -439,14 +538,7 @@ defmodule MobPair.Host do
         status: if(left <= 0, do: :invalid, else: :open)
     }
 
-    reply =
-      cond do
-        left <= 0 -> {:error, "too_many_attempts"}
-        reason == "wrong_code" -> {:error, "wrong_code", left}
-        true -> {:error, reason}
-      end
-
-    {:reply, reply, changed(%{state | secret: secret})}
+    {left, changed(%{state | secret: secret})}
   end
 
   defp advertise(state, false), do: state
@@ -465,6 +557,7 @@ defmodule MobPair.Host do
       }
       |> Map.reject(fn {_k, v} -> is_nil(v) end)
 
+    # Only on the link's interface, where siblings look for it.
     with {:ok, address} <- :inet.parse_strict_address(String.to_charlist(c.host)),
          {:ok, responder} <-
            [
@@ -472,6 +565,7 @@ defmodule MobPair.Host do
              instance: c.name,
              hostname: "#{c.service}-#{c.inst}.local",
              address: address,
+             interface: address,
              srv_port: c.port,
              txt: txt
            ]
@@ -485,32 +579,28 @@ defmodule MobPair.Host do
     end
   end
 
-  # The responder links to the server; a failed start must not take it down.
+  # The server traps exits: a responder that fails to start, or stops later,
+  # leaves it running without mDNS.
   defp start_responder(opts) do
-    trap? = Process.flag(:trap_exit, true)
-
-    try do
-      Responder.start_link(opts)
-    catch
-      :exit, reason -> {:error, reason}
-    after
-      Process.flag(:trap_exit, trap?)
-    end
+    Responder.start_link(opts)
+  catch
+    :exit, reason -> {:error, reason}
   end
 
+  # Each connection is admitted (see handle_call({:admit, ip}, ...)) before
+  # anything is spawned for it; one over a limit is closed here. The loop
+  # accepts nothing more until the server has answered.
   defp accept_loop(server, listen) do
-    case :ssl.transport_accept(listen) do
+    case :gen_tcp.accept(listen) do
       {:ok, socket} ->
-        handler =
-          spawn(fn ->
-            receive do
-              :go -> handle_connection(server, socket)
-            end
-          end)
-
-        case :ssl.controlling_process(socket, handler) do
-          :ok -> send(handler, :go)
-          {:error, _} -> Process.exit(handler, :kill)
+        with {:ok, {ip, _port}} <- :inet.peername(socket),
+             {:ok, handler} <- GenServer.call(server, {:admit, ip}, :infinity) do
+          case :gen_tcp.controlling_process(socket, handler) do
+            :ok -> send(handler, {:go, socket})
+            {:error, _} -> Process.exit(handler, :kill)
+          end
+        else
+          _busy -> :gen_tcp.close(socket)
         end
 
         accept_loop(server, listen)
@@ -523,12 +613,12 @@ defmodule MobPair.Host do
     end
   end
 
-  # One sibling's exchange, in its own process; at most @max_handshakes at a
-  # time (@max_per_source from one address), so a peer on the Wi-Fi can't
-  # exhaust processes or CPU, or hold every slot by itself.
-  defp handle_connection(server, transport_socket) do
-    with :ok <- admit(server, transport_socket),
-         {:ok, socket} <- :ssl.handshake(transport_socket, @handshake_timeout) do
+  # One sibling's exchange, in its own process (admitted by the server): TLS
+  # 1.3 with the host's certificate, then §1.5.
+  defp handle_connection(server, tcp, cert) do
+    options = [certs_keys: [Cert.ssl_cert_key(cert.cert, cert.key)]] ++ Wire.socket_options()
+
+    with {:ok, socket} <- :ssl.handshake(tcp, options, @handshake_timeout) do
       config = GenServer.call(server, :config)
 
       case exchange(server, socket, config) do
@@ -537,17 +627,6 @@ defmodule MobPair.Host do
       end
 
       :ssl.close(socket)
-    end
-  end
-
-  defp admit(server, transport_socket) do
-    with {:ok, {ip, _port}} <- :ssl.peername(transport_socket),
-         :ok <- GenServer.call(server, {:admit, self(), ip}) do
-      :ok
-    else
-      _busy_or_gone ->
-        :ssl.close(transport_socket)
-        :busy
     end
   end
 
@@ -699,21 +778,19 @@ defmodule MobPair.Host do
   defp decide(_server, _socket, %{approve: fun}, request) when is_function(fun, 1),
     do: fun.(request)
 
+  # The request is withdrawn when this process ends, however it ends
+  # (handle_info({:DOWN, ...})).
   defp decide(server, socket, %{approve: {:ask, _pid}}, request) do
     {:ok, ref} = GenServer.call(server, {:ask, request})
-    :ok = :ssl.setopts(socket, active: :once)
 
-    receive do
-      {:decision, ^ref, decision} ->
-        decision
-
-      {closed, ^socket} when closed in [:ssl_closed, :ssl_error] ->
-        GenServer.call(server, {:withdraw, ref})
-        {:error, :closed}
-    after
-      @decision_timeout ->
-        GenServer.call(server, {:withdraw, ref})
-        {:error, :timeout}
+    with :ok <- :ssl.setopts(socket, active: :once) do
+      receive do
+        {:decision, ^ref, decision} -> decision
+        {:ssl_closed, ^socket} -> {:error, :closed}
+        {:ssl_error, ^socket, _reason} -> {:error, :closed}
+      after
+        @decision_timeout -> {:error, :timeout}
+      end
     end
   end
 
@@ -749,6 +826,13 @@ defmodule MobPair.Host do
       # another request pinned the same certificate while this one waited for Allow
       {:error, :fingerprint_in_use} ->
         {:error, Wire.error("bad_cert")}
+
+      # the pairing couldn't be stored, so it wasn't made: the sibling may try again
+      {:error, {:store, _reason}} ->
+        {:error, Wire.error("busy")}
+
+      {:error, :invalid} ->
+        {:error, Wire.error("bad_node")}
     end
   end
 

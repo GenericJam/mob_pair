@@ -10,7 +10,7 @@ defmodule MobPair.Front do
   listener also serves same-phone siblings and development tools. The front
   is the host-side mirror of `MobPair.Tunnel`:
 
-    1. It listens with TLS 1.3 (by default on every interface), presents the
+    1. It listens with TLS 1.3 on the `:ip` it is given, presents the
        host's certificate and requires a client certificate that a pairing
        pinned (`node_for_fp`, default `MobPair.Pairings.node_for_fp/1`).
        Anything else fails the TLS handshake.
@@ -31,11 +31,19 @@ defmodule MobPair.Front do
   certificate unknown here (new connections fail) and the host disconnects
   the node (which closes the forwarded connection).
 
+  It listens only where told: `:ip` is required (the Wi-Fi address, as
+  `MobPair.Host` chooses it; `{0, 0, 0, 0}` only when the caller really means
+  every interface, mobile data and VPN included).
+
   At most `:max_connections` (default 8) forwarded connections are served at
-  once. Before that, at most 8 connections may be in their TLS handshake or
-  first message (2 per source address), and each must send its first
-  handshake message within 10 s, so a peer without a pinned certificate
-  can't hold the slots of paired siblings.
+  once. Before that, new connections are rate limited (`:accept_rate`,
+  default 40 at once then one per 100 ms; `:accept_rate_per_source`, default
+  10 at once then one per second from one address), at most 8 connections
+  may be in their TLS handshake or first message (2 per source address), and
+  each must send its first handshake message within 10 s, so a peer without
+  a pinned certificate can't hold the slots of paired siblings. A connection
+  over a limit is closed by the accept loop before anything is spawned for
+  it.
   """
 
   use GenServer
@@ -46,17 +54,28 @@ defmodule MobPair.Front do
   @max_connections 8
   @max_handshakes 8
   @max_per_source 2
+  @accept_rate {40, 100}
+  @accept_rate_per_source {10, 1_000}
   @max_handshake_frame 65_535
 
   @doc """
   Starts the front. Options: `:cert` (the host's `MobPair.Cert`, required),
   `:target` (`{ip, port}` of the node's plain listener, required), `:ip`
-  (listen address, default `{0, 0, 0, 0}`), `:port` (default 0, any),
-  `:node_for_fp` (a function from a client certificate's SHA-256 to the
-  paired node name, or nil), `:max_connections`, `:name`.
+  (the listen address, required), `:port` (default 0, any), `:node_for_fp`
+  (a function from a client certificate's SHA-256 to the paired node name,
+  or nil), `:max_connections`, `:accept_rate` and `:accept_rate_per_source`
+  (`{burst, interval_ms}`), `:name`.
+
+  Raises `ArgumentError` without `:ip`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
+    if not is_tuple(Keyword.get(opts, :ip)) do
+      raise ArgumentError,
+            "MobPair.Front needs :ip, the address to listen on (the Wi-Fi address; " <>
+              "{0, 0, 0, 0} only to listen on every interface, mobile data and VPN included)"
+    end
+
     case Keyword.fetch(opts, :name) do
       {:ok, name} -> GenServer.start_link(__MODULE__, opts, name: name)
       :error -> GenServer.start_link(__MODULE__, opts)
@@ -77,24 +96,32 @@ defmodule MobPair.Front do
     cert = Keyword.fetch!(opts, :cert)
     node_for_fp = Keyword.get(opts, :node_for_fp, &MobPair.Pairings.node_for_fp/1)
 
-    listen_options = [
+    # The listener is plain TCP: a connection is admitted (or closed) before
+    # any TLS work, and TLS starts on it in its own process (serve/4).
+    tls_options = [
       certs_keys: [Cert.ssl_cert_key(cert.cert, cert.key)],
       verify: :verify_peer,
       fail_if_no_peer_cert: true,
       cacerts: [],
       verify_fun: Cert.verify_fun(&(node_for_fp.(&1) != nil)),
       versions: [:"tlsv1.3"],
-      ip: Keyword.get(opts, :ip, {0, 0, 0, 0}),
-      reuseaddr: true,
       mode: :binary,
+      packet: :raw,
+      active: false
+    ]
+
+    listen_options = [
+      :binary,
+      ip: Keyword.fetch!(opts, :ip),
+      reuseaddr: true,
       packet: :raw,
       active: false,
       nodelay: true
     ]
 
     with {:ok, _} <- Application.ensure_all_started(:ssl),
-         {:ok, listen} <- :ssl.listen(Keyword.get(opts, :port, 0), listen_options),
-         {:ok, {_, port}} <- :ssl.sockname(listen) do
+         {:ok, listen} <- :gen_tcp.listen(Keyword.get(opts, :port, 0), listen_options),
+         {:ok, port} <- :inet.port(listen) do
       server = self()
       acceptor = spawn_link(fn -> accept_loop(server, listen) end)
 
@@ -103,9 +130,15 @@ defmodule MobPair.Front do
          listen: listen,
          port: port,
          acceptor: acceptor,
+         tls_options: tls_options,
          target: Keyword.fetch!(opts, :target),
          node_for_fp: node_for_fp,
          max: Keyword.get(opts, :max_connections, @max_connections),
+         admission:
+           MobPair.Admission.new(
+             Keyword.get(opts, :accept_rate, @accept_rate),
+             Keyword.get(opts, :accept_rate_per_source, @accept_rate_per_source)
+           ),
          connections: %{},
          handshakes: %{}
        }}
@@ -117,15 +150,29 @@ defmodule MobPair.Front do
   @impl true
   def handle_call(:port, _from, state), do: {:reply, state.port, state}
 
-  # Before TLS: a bounded number of handshakes, few per source address.
-  def handle_call({:admit, pid, ip}, _from, state) do
+  # From the accept loop, before anything runs for the connection: the
+  # connection rate (globally and from this address), then a bounded number
+  # of handshakes, few per source address. Admitted, the connection gets its
+  # own process, linked (it dies with the front) and monitored.
+  def handle_call({:admit, ip}, _from, state) do
     from_ip = Enum.count(state.handshakes, &match?({_pid, {_ref, ^ip}}, &1))
 
-    if map_size(state.handshakes) < @max_handshakes and from_ip < @max_per_source do
-      {:reply, {:ok, state.target, state.node_for_fp},
-       put_in(state.handshakes[pid], {Process.monitor(pid), ip})}
+    with true <- map_size(state.handshakes) < @max_handshakes and from_ip < @max_per_source,
+         {:ok, admission} <- MobPair.Admission.take(state.admission, ip) do
+      %{tls_options: tls_options, target: target, node_for_fp: node_for_fp} = state
+      server = self()
+
+      handler =
+        spawn_link(fn ->
+          receive do
+            {:go, socket} -> serve(server, socket, tls_options, {target, node_for_fp})
+          end
+        end)
+
+      handshakes = Map.put(state.handshakes, handler, {Process.monitor(handler), ip})
+      {:reply, {:ok, handler}, %{state | admission: admission, handshakes: handshakes}}
     else
-      {:reply, :busy, state}
+      _ -> {:reply, :busy, state}
     end
   end
 
@@ -154,19 +201,19 @@ defmodule MobPair.Front do
   def handle_info({:EXIT, pid, reason}, %{acceptor: pid} = state), do: {:stop, reason, state}
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
-  # The ssl listen socket's options hold the host's private key: keep it out
-  # of crash reports and :sys.get_status/1.
+  # The TLS options hold the host's private key: keep it out of crash
+  # reports and :sys.get_status/1.
   @impl true
   def format_status(status) do
     Map.update(status, :state, nil, fn
-      %{listen: _} = state -> %{state | listen: :redacted}
+      %{tls_options: _} = state -> %{state | tls_options: :redacted}
       other -> other
     end)
   end
 
   @impl true
   def terminate(_reason, state) do
-    :ssl.close(state.listen)
+    :gen_tcp.close(state.listen)
 
     for {pid, _} <- Map.merge(state.connections, state.handshakes),
         do: Process.exit(pid, :shutdown)
@@ -174,14 +221,20 @@ defmodule MobPair.Front do
     :ok
   end
 
+  # Each connection is admitted (see handle_call({:admit, ip}, ...)) before
+  # anything is spawned for it; one over a limit is closed here. The loop
+  # accepts nothing more until the front has answered.
   defp accept_loop(server, listen) do
-    case :ssl.transport_accept(listen) do
+    case :gen_tcp.accept(listen) do
       {:ok, socket} ->
-        handler = spawn(fn -> receive(do: (:go -> serve(server, socket))) end)
-
-        case :ssl.controlling_process(socket, handler) do
-          :ok -> send(handler, :go)
-          {:error, _} -> Process.exit(handler, :kill)
+        with {:ok, {ip, _port}} <- :inet.peername(socket),
+             {:ok, handler} <- GenServer.call(server, {:admit, ip}, :infinity) do
+          case :gen_tcp.controlling_process(socket, handler) do
+            :ok -> send(handler, {:go, socket})
+            {:error, _} -> Process.exit(handler, :kill)
+          end
+        else
+          _busy -> :gen_tcp.close(socket)
         end
 
         accept_loop(server, listen)
@@ -194,12 +247,12 @@ defmodule MobPair.Front do
     end
   end
 
-  # One sibling connection, in its own process.
-  defp serve(server, transport_socket) do
+  # One sibling connection, in its own process (admitted by the front). A
+  # refused one ends here; its sockets close with the process.
+  defp serve(server, socket, tls_options, {target, node_for_fp}) do
     Process.monitor(server)
 
-    with {:ok, target, node_for_fp} <- admit(server, transport_socket),
-         {:ok, tls} <- :ssl.handshake(transport_socket, @handshake_timeout),
+    with {:ok, tls} <- :ssl.handshake(socket, tls_options, @handshake_timeout),
          {:ok, expected} <- paired_node(tls, node_for_fp),
          {:ok, first, rest} <- first_message(tls),
          :ok <- same_name(first, expected),
@@ -211,17 +264,6 @@ defmodule MobPair.Front do
       :ok = :inet.setopts(tcp, active: :once)
       :ok = :ssl.setopts(tls, active: :once)
       loop(%{tcp: tcp, tls: tls, in: to_node, out: {:handshake, ""}})
-    else
-      _refused -> :ssl.close(transport_socket)
-    end
-  end
-
-  defp admit(server, transport_socket) do
-    with {:ok, {ip, _port}} <- :ssl.peername(transport_socket),
-         {:ok, target, node_for_fp} <- GenServer.call(server, {:admit, self(), ip}) do
-      {:ok, target, node_for_fp}
-    else
-      _busy_or_gone -> {:error, :busy}
     end
   end
 

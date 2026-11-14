@@ -41,7 +41,8 @@ defmodule MobPair.Discovery do
 
   The instance name is the DNS-SD instance label (`FMutate A`, possibly
   suffixed ` (2)` by the responder). `host` is the A record of the SRV
-  target, or the source address of the reply when that is missing.
+  target, or the source address of the reply when that is missing; `source`
+  is the address the reply came from.
 
   ## Spoofed answers
 
@@ -49,18 +50,25 @@ defmodule MobPair.Discovery do
   instance label, `fp` and `inst`. So nothing one responder says can change
   what another said: a reply is only taken when its id is one of the
   queries' ids, and the PTR, SRV, TXT and A records are kept per instance
-  *and* per reply source (`{ip, port}`). SRV and TXT records count only from
-  the source whose PTR named the instance, and A records only for that
-  source's SRV targets. A forged reply under FMutate's label therefore
-  becomes a second candidate next to the genuine one, never a replacement;
-  `MobPair.Join` tries candidates and keeps the one whose TLS
-  fingerprint and cookie handshake succeed.
+  *and* per reply source address (one machine answering from many ports is
+  one source). SRV and TXT records count only from the source whose PTR
+  named the instance, and A records only for that source's SRV targets. A
+  forged reply under FMutate's label from another machine therefore becomes
+  a second candidate next to the genuine one, never a replacement;
+  `MobPair.Join` tries candidates (spread across sources) and keeps the one
+  whose TLS fingerprint and cookie handshake succeed. One source names at
+  most 4 instances, so a flood of names from one machine can't crowd the
+  others out of the 64 kept.
 
   Candidates are deduplicated by `{fp, inst, host, dist_port}` (the latest
   answer wins; anything that changes where Humdinger would connect is a
   separate candidate) and ordered by name. Every string is the binary from
   the packet; no atoms are created from network data. Malformed packets are
   ignored (see `MobPair.Dns`).
+
+  The sockets hand over one datagram at a time (`active: :once`) and at
+  most 64 are read per 100 ms; a flood waits in (and overflows) the
+  kernel's socket buffer, never in the caller's mailbox.
   """
 
   alias MobPair.Dns
@@ -70,12 +78,16 @@ defmodule MobPair.Discovery do
   @resends [0, 250, 750]
   @recv_max 9000
   @max_instances 64
+  @max_per_source 4
+  @max_packets 64
+  @window 100
 
   @type candidate :: %{
           name: String.t(),
           inst: String.t(),
           node: String.t(),
           host: String.t(),
+          source: String.t(),
           port: :inet.port_number() | nil,
           dist_port: :inet.port_number() | nil,
           fp: <<_::256>>,
@@ -117,6 +129,9 @@ defmodule MobPair.Discovery do
         resends: Enum.map(Enum.filter(@resends, &(&1 < timeout)), &(&1 + now)),
         query: Dns.encode_query([%{name: service, type: :ptr}], id),
         ids: MapSet.new([id]),
+        window: now + @window,
+        packets: 0,
+        paused: [],
         seq: 0,
         instances: %{},
         a: %{},
@@ -156,7 +171,7 @@ defmodule MobPair.Discovery do
   defp open(address, extra) do
     :gen_udp.open(
       0,
-      [:binary, active: true, ip: address, multicast_ttl: 255, recbuf: 65_536] ++ extra
+      [:binary, active: :once, ip: address, multicast_ttl: 255, recbuf: 65_536] ++ extra
     )
   end
 
@@ -191,6 +206,7 @@ defmodule MobPair.Discovery do
 
   defp collect(state) do
     now = now()
+    state = next_window(state, now)
 
     case state.resends do
       [at | rest] when at <= now ->
@@ -198,22 +214,45 @@ defmodule MobPair.Discovery do
         collect(%{state | resends: rest})
 
       resends ->
-        wake = Enum.min([state.deadline | resends])
-        wait = max(wake - now, 0)
+        wakes = if state.paused == [], do: resends, else: [state.window | resends]
+        wait = max(Enum.min([state.deadline | wakes]) - now, 0)
 
         if now >= state.deadline, do: state, else: receive_reply(state, wait)
     end
   end
 
+  # A reply is filed under its source address, whatever port it came from.
   defp receive_reply(state, wait) do
     sockets = state.sockets
 
     receive do
-      {:udp, socket, ip, port, data} when is_map_key(sockets, socket) ->
-        state |> handle_reply(socket, {ip, port}, data) |> collect()
+      {:udp, socket, ip, _port, data} when is_map_key(sockets, socket) ->
+        state
+        |> handle_reply(socket, ip, data)
+        |> Map.update!(:packets, &(&1 + 1))
+        |> rearm(socket)
+        |> collect()
     after
       wait -> collect(state)
     end
+  end
+
+  # One datagram at a time per socket; past this window's budget the socket
+  # waits for the next window.
+  defp rearm(state, socket) do
+    if state.packets < @max_packets do
+      :inet.setopts(socket, active: :once)
+      state
+    else
+      %{state | paused: [socket | state.paused]}
+    end
+  end
+
+  defp next_window(%{window: window} = state, now) when now < window, do: state
+
+  defp next_window(state, now) do
+    Enum.each(state.paused, &:inet.setopts(&1, active: :once))
+    %{state | window: now + @window, packets: 0, paused: []}
   end
 
   defp send_all(state, packet) do
@@ -267,8 +306,12 @@ defmodule MobPair.Discovery do
         %{state | instances: Map.put(state.instances, key, entry)}
 
       instances when map_size(instances) < @max_instances ->
-        entry = %{name: label, seq: state.seq, srv: nil, txt: nil}
-        %{state | instances: Map.put(instances, key, entry)}
+        if Enum.count(instances, &match?({{^source, _key}, _entry}, &1)) < @max_per_source do
+          entry = %{name: label, seq: state.seq, srv: nil, txt: nil}
+          %{state | instances: Map.put(instances, key, entry)}
+        else
+          state
+        end
 
       _ ->
         state
@@ -389,6 +432,7 @@ defmodule MobPair.Discovery do
          inst: inst,
          node: node,
          host: host(state, source, entry),
+         source: source |> :inet.ntoa() |> to_string(),
          port: port(txt["port"]),
          dist_port: port(txt["dport"]),
          fp: fp,
@@ -407,11 +451,11 @@ defmodule MobPair.Discovery do
     end
   end
 
-  defp host(state, {ip, _port} = source, entry) do
+  defp host(state, source, entry) do
     address =
       case entry.srv do
-        %{target: target} -> Map.get(state.a, {source, Dns.name_key(target)}, ip)
-        _ -> ip
+        %{target: target} -> Map.get(state.a, {source, Dns.name_key(target)}, source)
+        _ -> source
       end
 
     address |> :inet.ntoa() |> to_string()

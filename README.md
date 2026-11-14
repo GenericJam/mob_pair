@@ -17,11 +17,17 @@ Pure Elixir/OTP (`ssl`, `public_key`, `crypto`); no native code, no `mob` depend
 ## Host ("My code")
 
 ```elixir
-# once, with the app's other processes (the store keeps cookies and pinned certificates)
+# once, with the app's other processes (the store keeps cookies and pinned certificates).
+# allow_list: :auto (default) keeps net_kernel's allow list to the paired names, so no other
+# node name reaches OTP's handshake to become an atom.
 {MobPair.Pairings, store: {MobPair.Pairings.FileStore, path: Path.join(data_dir, "pairings.json")}}
 
 # a node whose distribution starts at runtime (a Mob app): once Node.start/2 returned
 :ok = MobPair.Pairings.distribution_started()
+
+# Disconnect: in force at once; {:error, {:store, reason}} when it couldn't be saved yet
+# (retried; MobPair.Pairings.saved?/0 turns true again when it was): say so on screen
+MobPair.Pairings.revoke(node)
 
 # while the Pair screen is open
 {:ok, host} =
@@ -46,8 +52,10 @@ MobPair.Host.info(host)
 
 A node started at runtime on plain loopback distribution (a Mob app) serves other phones
 through `MobPair.Front` (TLS 1.3, pinned client certificates, paired names checked, forwarded
-to the loopback listener). A node booted with `MobPair.boot_args/1` and
-`MobPair.Pairings.write_ssl_dist_optfile/2` runs stock `inet_tls` instead.
+to the loopback listener; `ip:` is required, e.g. the Wi-Fi address). A node booted with
+`MobPair.boot_args/1` and `MobPair.Pairings.write_ssl_dist_optfile/2` runs stock `inet_tls`
+instead. `Host` and `Front` limit connections before authentication (8, 2 per address, and
+`:accept_rate` / `:accept_rate_per_source` token buckets).
 
 ## Joiner ("Scan")
 

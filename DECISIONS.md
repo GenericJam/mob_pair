@@ -73,11 +73,18 @@ rather than changing v1's; JSON keeps both ends free of atoms from the network.
   sent to a pinned host (`Client.pair/4` refuses a token without `fp`).
 - **Where the endpoint listens:** loopback (apps on this phone) and the address in the link
   (Wi-Fi), on one port; never `0.0.0.0`, so mobile data, VPN and tethering never see the
-  pre-auth surface. At most 8 connections before authentication, 2 per source address, 10 s
-  for the TLS handshake, so one peer can't hold every slot. (Anyone who reaches the port can
-  still burn the 5 attempts: New code.) `Front` has the same pre-auth limits, counted apart
-  from its forwarded connections, so a peer without a pinned certificate can't crowd out
-  paired siblings.
+  pre-auth surface. `Front` has no default address: `:ip` is required (a wildcard only if the
+  caller passes one). Admission, in the acceptor before any process or TLS handshake: at most
+  8 connections before authentication, 2 per source address, and token buckets on accepted
+  connections (`:accept_rate`, 40 then 1 per 100 ms, and `:accept_rate_per_source`, 10 then 1
+  a second); an over-limit socket is closed at once. 10 s for the TLS handshake. An SRP
+  challenge the joiner leaves without a proof (hangs up, sends garbage) counts as a failed
+  attempt, so repeated TLS + `A` + disconnect can't make the host compute verifiers for free.
+  (Anyone who reaches the port can still burn the 5 attempts: New code.) `Front` has the same
+  pre-auth limits, counted apart from its forwarded connections, so a peer without a pinned
+  certificate can't crowd out paired siblings. Stopping a `Host` (the Pair screen closes)
+  closes the connections in progress and withdraws their requests (`{:mob_pair_withdrawn,
+  host, ref}`).
 - **SRP-6a** (RFC 5054 2048-bit group, SHA-256 `x`, `K = SHA-256(PAD(S))`): the code is never
   sent; `M1`/`M2` are HMACs over the certificate the joiner saw and the RFC 9266 TLS exporter,
   so a relay that terminates TLS fails the proofs and gets one online guess per attempt.
@@ -104,6 +111,16 @@ rather than changing v1's; JSON keeps both ends free of atoms from the network.
   comes up is dropped at `nodeup`; after that the name may come back another way (FMutate's
   same-key Allow). Revoking can't undo what a connected node already did: distribution is
   full trust.
+- **Persistence fails closed.** `add/1` grants nothing unless the store saved it
+  (`{:error, {:store, reason}}`; the Host answers `busy`). `revoke/1` takes effect in the VM at
+  once and returns `:ok` only once the store no longer holds the pairing; if the save fails it
+  returns `{:error, {:store, reason}}`, deletes the store (`Store.delete/1`) so the revoked
+  pairing can't come back at the next start (the others then need pairing again if the app
+  restarts before the store recovers), and retries the save (1 s doubling to a minute;
+  `saved?/0` tells the app). If the store can't be deleted either, a restart inside that window
+  can bring the revoked pairing back; nothing in Erlang can do better. Files are written to a
+  synced temporary file and renamed; the directory entry isn't synced (Erlang can't open a
+  directory to fsync it), so a power cut right after a write can bring the previous file back.
 - **Carriers:** plain `inet_tcp` only on loopback (the host's listener bound to 127.0.0.1);
   a joiner on another address is always granted `inet_tls` (mutual TLS 1.3, both certificates
   pinned). `Record.validate/1` and `Transport.connect/2` refuse plain distribution to a
@@ -114,12 +131,28 @@ rather than changing v1's; JSON keeps both ends free of atoms from the network.
   be used under another pairing's name (the cookie check then still applies).
 - **mDNS is unauthenticated:** answers only produce candidates to *try* (pinned TLS + cookie
   decide); a reply is accepted only with one of the query's ids, and records are kept per
-  reply source, so a forged reply is a second candidate, never a replacement. A typed code is
-  tried against at most 8 candidates, unicast IPv4 or loopback only.
+  reply source IP (the port doesn't count), at most 4 instances per source, so a forged reply
+  is a second candidate, never a replacement, and one machine can't crowd out another. A typed
+  code is tried against at most 8 candidates, unicast IPv4 or loopback only, round-robin
+  across sources in random order; a candidate that fails before it authenticated
+  (`fingerprint_mismatch`, a bad proof, a timeout) doesn't stop the search. Both UDP sockets
+  read `active: :once` with a per-window packet budget (the excess waits in, or is dropped by,
+  the kernel), and the responder sends at most `:max_replies` a second. `Host` advertises only
+  on its link's interface (`Responder` `:interface`): it joins the group there and treats only
+  that subnet as on-link; a responder that stops leaves the Host running.
 - **Atoms:** node names and cookies become atoms only from an approved pairing or a validated
-  stored record, never from pairing or mDNS input.
+  stored record, never from pairing or mDNS input; `Pairings.add/1`, `Transport.connect/2`
+  (`Record.validate/1`) and `Transport.start_node/1` check what they atomize whoever calls
+  them. On the host's node, OTP's distribution handshake makes an atom of every name a
+  connecting node declares before it checks the cookie, unless the `net_kernel` allow list
+  refuses the name first; an empty allow list allows everything. So `allow_list: :auto`
+  (default) sets a placeholder name plus the paired names right after distribution starts,
+  and any other name is refused with no atom made. A host that turns it off (`false`) must keep
+  its own non-empty allow list, or anyone who reaches its listener (any app on an Android phone,
+  for a loopback listener) can fill the atom table. The few connections accepted between
+  `Node.start/2` and the first `allow/1` are the only window.
 - **Secrets at rest:** cookies and private keys are hidden from `inspect` (`Record`) and from
-  `:sys.get_status/1` (`Host`, `Front`: their ssl listen sockets carry the key too), and
+  `:sys.get_status/1` (`Host`, `Front`: their TLS options carry the key too), and
   written 0600 inside a fresh 0700 directory, fsynced, then renamed into place
   (`Pairings.write_private/2`: `Pairings.FileStore`, `-ssl_dist_optfile`). Where the platform
   has a hardware-backed store, apps should prefer it (`MobPair.Store` / `Pairings.Store` are
@@ -175,10 +208,13 @@ at once.
 ## 8. Adopting
 
 - **FMutate** (first host): `FMutate.Pairing` + `FMutate.PairScreen`; `FMutate.Dist` follows
-  `MobPair.Pairings` (`default_cookie: :keep, allow_list: false` since `FMutate.Dist` owns
-  the default cookie and admission) and calls `distribution_started/0`; the names
-  `FMutate.Dist` already allowed through the same-key content provider are `:reserved`.
-  Copy link copies `Host.local_link/1` (host 127.0.0.1).
+  `MobPair.Pairings` (`default_cookie: :keep` since `FMutate.Dist` owns the default cookie;
+  `allow_list: :auto` in release builds, `false` only in builds deployed by mob_dev, whose
+  tools connect under names chosen per run) and calls `distribution_started/0`. Same-key
+  siblings register their node name through FMutate's content provider before they connect
+  (FMutate protocol.md §7), and FMutate adds the name to the allow list only when the player
+  allows it; those names are `:reserved`. Copy link copies `Host.local_link/1` (host
+  127.0.0.1). Disconnect shows `revoke/1`'s store error and `saved?/0`.
 - **Humdinger** (joiner today, its own copies): replace `Humdinger.FMutate.{Code, PairLink,
   Cert, Wire, Srp, Record, Pairing.Client, Pairing, Discovery, Dns, Epmd, Tunnel, Transport}`
   and `Reference.*` with the package (`service: "fmutate"`); keep `Humdinger.FMutate` (the

@@ -339,6 +339,42 @@ defmodule MobPair.DistTest do
     assert Enum.all?(on_port, &match?({{127, 0, 0, 1}, _}, &1))
   end
 
+  # Any app on the phone can reach the loopback listener and declare a name: OTP's handshake makes
+  # an atom of it unless the allow list (never empty: :allow_list :auto) refuses it first.
+  test "names the host never paired don't become atoms there, however many are tried" do
+    host = start_host(:inet_tcp)
+    atoms = fn -> :peer.call(host.peer, :erlang, :system_info, [:atom_count]) end
+    prefix = "intruder#{System.unique_integer([:positive])}x"
+
+    try_name = fn i ->
+      name = "#{prefix}#{i}@127.0.0.1"
+
+      {:ok, socket} =
+        :gen_tcp.connect(~c"127.0.0.1", host.port, [:binary, active: false, packet: 2])
+
+      :ok =
+        :gen_tcp.send(socket, <<?N, @dist_flags::64, 1::32, byte_size(name)::16, name::binary>>)
+
+      assert {:ok, "snot_allowed"} = :gen_tcp.recv(socket, 0, 5_000)
+      :gen_tcp.close(socket)
+    end
+
+    # the first refusals load the code that reports them
+    Enum.each(1..20, try_name)
+    before = atoms.()
+    Enum.each(21..520, try_name)
+
+    assert atoms.() - before < 20
+    refute Enum.any?(1..520, &atom_on?(host.peer, "#{prefix}#{&1}@127.0.0.1"))
+  end
+
+  defp atom_on?(peer, name) do
+    _ = :peer.call(peer, :erlang, :binary_to_existing_atom, [name])
+    true
+  rescue
+    _ -> false
+  end
+
   describe "revocation and admission" do
     test "revoking aborts a handshake that already read the old cookie" do
       host = start_host(:inet_tcp)

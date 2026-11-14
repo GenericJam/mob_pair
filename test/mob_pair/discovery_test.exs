@@ -53,21 +53,22 @@ defmodule MobPair.DiscoveryTest do
   # a busy test run can't push the late reply past the window.
   @late_timeout 1_000
 
-  # A loopback responder that answers each query with `fun.(query)`, a list
-  # of datagrams. A reply is only taken when it echoes a query's id.
-  defp fake(fun) do
+  # A responder that answers each query with `fun.(query)`, a list of
+  # datagrams, from `ip` (loopback by default; another machine is played by
+  # the LAN address). A reply is only taken when it echoes a query's id.
+  defp fake(fun, ip \\ {127, 0, 0, 1}) do
     test = self()
 
     pid =
       spawn_link(fn ->
-        {:ok, socket} = :gen_udp.open(0, [:binary, active: true, ip: {127, 0, 0, 1}])
+        {:ok, socket} = :gen_udp.open(0, [:binary, active: true, ip: ip])
         send(test, {:fake_port, :inet.port(socket)})
         fake_loop(socket, fun)
       end)
 
     assert_receive {:fake_port, {:ok, port}}
     on_exit(fn -> Process.exit(pid, :kill) end)
-    {{127, 0, 0, 1}, port}
+    {ip, port}
   end
 
   defp fake_loop(socket, fun) do
@@ -111,6 +112,7 @@ defmodule MobPair.DiscoveryTest do
                   inst: "a",
                   node: "fmutate_a@192.168.1.23",
                   host: "192.168.1.23",
+                  source: "127.0.0.1",
                   port: 45_123,
                   dist_port: 45_200,
                   fp: @fp,
@@ -173,8 +175,9 @@ defmodule MobPair.DiscoveryTest do
   end
 
   # Anyone can answer with FMutate's label, fp and inst. The forged reply
-  # reuses the genuine SRV target name, so neither its PTR, SRV, TXT nor A
-  # may land on the genuine instance, whichever comes first.
+  # (from another machine) reuses the genuine SRV target name, so neither
+  # its PTR, SRV, TXT nor A may land on the genuine instance, whichever comes
+  # first.
   for forged_first? <- [false, true] do
     test "a forged reply under the genuine label is a second candidate (forged first: #{forged_first?})" do
       {genuine_delay, forged_delay} = if unquote(forged_first?), do: {60, 0}, else: {0, 60}
@@ -188,10 +191,13 @@ defmodule MobPair.DiscoveryTest do
         end)
 
       forged =
-        fake(fn query ->
-          Process.sleep(forged_delay)
-          [reply(query, "FMutate A", forged_txt, target, {10, 0, 0, 66})]
-        end)
+        fake(
+          fn query ->
+            Process.sleep(forged_delay)
+            [reply(query, "FMutate A", forged_txt, target, {10, 0, 0, 66})]
+          end,
+          lan_ip()
+        )
 
       assert {:ok, candidates} = browse([genuine, forged], @late_timeout)
 
@@ -205,22 +211,146 @@ defmodule MobPair.DiscoveryTest do
     end
   end
 
-  test "a forged reply for the genuine host with another dport is a second candidate" do
+  test "a forged reply from another machine for the genuine host with another dport is a second candidate" do
     target = ["fmutate-a", "local"]
 
     genuine =
       fake(fn query -> [reply(query, "FMutate A", txt(), target, {10, 0, 0, 1})] end)
 
     forged =
-      fake(fn query ->
-        Process.sleep(60)
-        [reply(query, "FMutate A", txt(%{"dport" => "1"}), target, {10, 0, 0, 1})]
-      end)
+      fake(
+        fn query ->
+          Process.sleep(60)
+          [reply(query, "FMutate A", txt(%{"dport" => "1"}), target, {10, 0, 0, 1})]
+        end,
+        lan_ip()
+      )
 
     assert {:ok, candidates} = browse([genuine, forged], @late_timeout)
 
     assert candidates |> Enum.map(&{&1.host, &1.dist_port}) |> Enum.sort() ==
              [{"10.0.0.1", 1}, {"10.0.0.1", 45_200}]
+  end
+
+  test "one machine answering from many ports is one source: its latest answer wins" do
+    target = ["fmutate-a", "local"]
+
+    ports =
+      for dport <- ["1", "2", "3"] do
+        fake(fn query ->
+          Process.sleep(String.to_integer(dport) * 40)
+          [reply(query, "FMutate A", txt(%{"dport" => dport}), target, {10, 0, 0, 1})]
+        end)
+      end
+
+    assert {:ok, [%{dist_port: 3, source: "127.0.0.1"}]} = browse(ports, @late_timeout)
+  end
+
+  test "a flood of instance names from one machine can't crowd out another machine's" do
+    flood =
+      fake(fn query ->
+        for n <- 1..70, do: answer(query, "Forged #{n}", txt(%{"inst" => "f#{n}"}))
+      end)
+
+    genuine =
+      fake(
+        fn query ->
+          Process.sleep(60)
+          [answer(query, "FMutate A", txt(), {10, 0, 0, 1})]
+        end,
+        lan_ip()
+      )
+
+    assert {:ok, candidates} = browse([flood, genuine], @late_timeout)
+    assert Enum.count(candidates, &(&1.source == "127.0.0.1")) <= 4
+    assert %{host: "10.0.0.1"} = Enum.find(candidates, &(&1.name == "FMutate A"))
+  end
+
+  test "a flood of replies waits in the socket, not in the browsing process's mailbox" do
+    target =
+      fake(fn query ->
+        noise = answer(%{query | id: Bitwise.bxor(query.id, 1)}, "Noise", txt())
+        [answer(query, "FMutate A", txt()) | List.duplicate(noise, 2_000)]
+      end)
+
+    test = self()
+    browser = spawn_link(fn -> send(test, {:browsed, browse([target], 500)}) end)
+
+    # one datagram at a time (plus, briefly, the port's reply to a send)
+    assert max_queue(browser, 0) <= 2
+    assert_receive {:browsed, {:ok, [%{name: "FMutate A"}]}}, 2_000
+  end
+
+  describe "the responder under load" do
+    test "a flood of queries waits in its socket, not its mailbox" do
+      pid = start_responder([])
+      {_ip, port} = target(pid)
+      {:ok, socket} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}])
+      on_exit(fn -> :gen_udp.close(socket) end)
+      query = Dns.encode_query([%{name: @service, type: :ptr}], 1)
+
+      :ok = :sys.suspend(pid)
+      for _ <- 1..500, do: :gen_udp.send(socket, {127, 0, 0, 1}, port, query)
+      Process.sleep(100)
+      {:message_queue_len, queued} = Process.info(pid, :message_queue_len)
+      :ok = :sys.resume(pid)
+
+      assert queued <= 1
+    end
+
+    test "it sends at most :max_replies replies a second" do
+      pid = start_responder(max_replies: 3)
+      {_ip, port} = target(pid)
+      {:ok, socket} = :gen_udp.open(0, [:binary, active: true, ip: {127, 0, 0, 1}])
+      on_exit(fn -> :gen_udp.close(socket) end)
+      query = Dns.encode_query([%{name: @service, type: :ptr}], 1)
+
+      for _ <- 1..6, do: :gen_udp.send(socket, {127, 0, 0, 1}, port, query)
+      assert replies(socket, 300) == 3
+
+      # the next second has its own budget
+      Process.sleep(1_000)
+      :gen_udp.send(socket, {127, 0, 0, 1}, port, query)
+      assert replies(socket, 300) == 1
+    end
+
+    test "it serves only a local interface it is given" do
+      assert {:error, {{:no_interface, {10, 255, 255, 254}}, _}} =
+               start_supervised(
+                 {Responder,
+                  service: "fmutate",
+                  instance: "FMutate A",
+                  hostname: "fmutate-a.local",
+                  address: {10, 255, 255, 254},
+                  interface: {10, 255, 255, 254},
+                  srv_port: 1,
+                  bind: {{127, 0, 0, 1}, 0}}
+               )
+    end
+  end
+
+  defp replies(socket, wait) do
+    receive do
+      {:udp, ^socket, _ip, _port, _data} -> 1 + replies(socket, wait)
+    after
+      wait -> 0
+    end
+  end
+
+  # The longest the process's mailbox got while it ran.
+  defp max_queue(pid, seen) do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, len} -> max_queue(pid, max(seen, len))
+      nil -> seen
+    end
+  end
+
+  defp lan_ip do
+    {:ok, interfaces} = :inet.getifaddrs()
+
+    Enum.find_value(interfaces, fn {_name, opts} ->
+      Enum.find(Keyword.get_values(opts, :addr), &match?({a, _, _, _} when a != 127, &1))
+    end) || flunk("needs a non-loopback IPv4 address")
   end
 
   test "deduplicates by fp and inst, keeps distinct instances, orders by name" do

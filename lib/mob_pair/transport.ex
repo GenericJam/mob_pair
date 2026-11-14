@@ -84,11 +84,13 @@ defmodule MobPair.Transport do
 
   @doc """
   Connects to the paired host. `owner` owns the TLS tunnel (it closes
-  when `owner` exits).
+  when `owner` exits). The record is validated first (`Record.validate/1`):
+  its names and cookie become atoms.
   """
   @impl true
   def connect(%Record{} = record, owner) do
     with :ok <- safe_carrier(record),
+         {:ok, record} <- Record.validate(record),
          :ok <- ensure_node(record.self_node),
          {:ok, route, tunnel} <- open_route(record, owner) do
       node = String.to_atom(record.node)
@@ -133,11 +135,13 @@ defmodule MobPair.Transport do
   @doc """
   Starts this VM's distribution as `name` (`"short@host"`): hidden, no
   listener, no auto-connect, a random default cookie, `MobPair.Epmd` as port
-  mapper. `{:error, {:node_name, node}}` if it already runs as another node.
+  mapper. `{:error, {:node_name, node}}` if it already runs as another node,
+  `{:error, {:invalid, :self_node}}` for a name `Record.self_node?/1` refuses.
   """
   @spec start_node(String.t()) :: :ok | {:error, term()}
   def start_node(name) do
-    with :ok <- setup() do
+    with :ok <- valid_name(name),
+         :ok <- setup() do
       # auth reads or creates $HOME/.config/erlang/.erlang.cookie when the
       # node starts (Android has no such directory until made).
       if System.get_env("MOB_BEAMS_DIR") && System.get_env("HOME"),
@@ -159,6 +163,9 @@ defmodule MobPair.Transport do
       end
     end
   end
+
+  defp valid_name(name),
+    do: if(Record.self_node?(name), do: :ok, else: {:error, {:invalid, :self_node}})
 
   # Plain distribution checks the cookie in the handshake and nothing after
   # it: anyone on the path could inject messages (code) into both nodes. Only

@@ -2,9 +2,37 @@ defmodule MobPair.PairingTest do
   # MobPair.Pairings is a named singleton (as on the host's node).
   use ExUnit.Case, async: false
 
-  alias MobPair.{Cert, Client, Discovery, Host, Join, Link, Pairings, Responder}
+  alias MobPair.{Cert, Client, Discovery, Dns, Host, Join, Link, Pairings, Responder, Srp, Wire}
 
   @self_node "humdinger_test@127.0.0.1"
+
+  # The first non-loopback IPv4 address (lan_ip/0's) and one on another
+  # local subnet, or nil: the mDNS interface test needs both.
+  @two_subnets (fn ->
+                  {:ok, interfaces} = :inet.getifaddrs()
+
+                  nets =
+                    for {_name, opts} <- interfaces,
+                        {addr, mask} <-
+                          Enum.zip(
+                            for({:addr, {a, _, _, _} = ip} <- opts, a != 127, do: ip),
+                            for({:netmask, {_, _, _, _} = m} <- opts, do: m)
+                          ),
+                        do: {addr, mask}
+
+                  net = fn {a, b, c, d}, {w, x, y, z} ->
+                    {Bitwise.band(a, w), Bitwise.band(b, x), Bitwise.band(c, y),
+                     Bitwise.band(d, z)}
+                  end
+
+                  with [{lan, mask} | rest] <- nets,
+                       {other, _} <-
+                         Enum.find(rest, fn {ip, _} -> net.(ip, mask) != net.(lan, mask) end) do
+                    {lan, other}
+                  else
+                    _ -> nil
+                  end
+                end).()
 
   setup do
     start_supervised!(Pairings)
@@ -25,8 +53,9 @@ defmodule MobPair.PairingTest do
       approve: fn _request -> :allow end
     ]
 
+    {id, opts} = Keyword.pop(opts, :id, make_ref())
     opts = Keyword.merge(defaults, opts)
-    server = start_supervised!({Host, opts}, id: make_ref())
+    server = start_supervised!({Host, opts}, id: id)
     {server, opts[:cert]}
   end
 
@@ -591,6 +620,234 @@ defmodule MobPair.PairingTest do
       :ok = Host.renew(server)
       assert {:ok, _} = Client.pair(target(server), {:code, code(server)}, identity())
     end
+  end
+
+  describe "admission" do
+    test "connections over the per-source rate are closed before the TLS handshake" do
+      lan = lan_ip()
+
+      {server, fmutate} =
+        start_server(ip: {0, 0, 0, 0}, host: lan, accept_rate_per_source: {2, 60_000})
+
+      for _ <- 1..2 do
+        assert {:ok, socket} = tls_connect(~c"127.0.0.1", Host.port(server))
+        :ssl.close(socket)
+      end
+
+      # the slots are free again; the rate isn't
+      Process.sleep(100)
+      assert {:error, _} = tls_connect(~c"127.0.0.1", Host.port(server))
+
+      # another address still gets in
+      {:ok, link} = Link.parse(Host.link(server))
+      remote = %{target(server, fmutate.fp) | host: lan}
+      assert {:ok, _} = Client.pair(remote, {:token, link.token}, identity())
+    end
+
+    test "connections over the global rate are closed, whatever their address" do
+      lan = lan_ip()
+      {server, _} = start_server(ip: {0, 0, 0, 0}, host: lan, accept_rate: {2, 60_000})
+
+      for host <- [~c"127.0.0.1", String.to_charlist(lan)] do
+        assert {:ok, socket} = tls_connect(host, Host.port(server))
+        :ssl.close(socket)
+      end
+
+      Process.sleep(100)
+      assert {:error, _} = tls_connect(String.to_charlist(lan), Host.port(server))
+    end
+
+    test "an SRP challenge left without a proof counts as a failed attempt" do
+      {server, _} = start_server(notify: self(), max_attempts: 2)
+
+      for status <- [:open, :invalid] do
+        socket = srp_challenge(server)
+        :ssl.close(socket)
+        assert_receive {:mob_pair_secret, ^server, ^status}, 2_000
+      end
+
+      assert Client.pair(target(server), {:code, code(server)}, identity()) ==
+               {:error, :too_many_attempts}
+    end
+
+    test "the front listens only where it's told" do
+      opts = [cert: Cert.self_signed("FMutate A"), target: {{127, 0, 0, 1}, 1}, node_for_fp: & &1]
+      assert_raise ArgumentError, ~r/:ip/, fn -> MobPair.Front.start_link(opts) end
+    end
+
+    test "the front closes connections over its rate before the TLS handshake" do
+      front =
+        start_supervised!(
+          {MobPair.Front,
+           cert: Cert.self_signed("FMutate A"),
+           ip: {127, 0, 0, 1},
+           target: {{127, 0, 0, 1}, 1},
+           node_for_fp: & &1,
+           accept_rate_per_source: {1, 60_000}}
+        )
+
+      [first, second] =
+        for _ <- 1..2 do
+          {:ok, socket} =
+            :gen_tcp.connect(~c"127.0.0.1", MobPair.Front.port(front), [:binary, active: false])
+
+          on_exit(fn -> :gen_tcp.close(socket) end)
+          socket
+        end
+
+      # the first waits in its TLS handshake; the second is closed at once
+      assert :gen_tcp.recv(second, 0, 1_000) == {:error, :closed}
+      assert :gen_tcp.recv(first, 0, 300) == {:error, :timeout}
+    end
+  end
+
+  describe "closing the Pair screen" do
+    test "closes the connections in progress" do
+      {server, _} = start_server(id: :closing)
+      # the host's connection is running: it has sent its challenge
+      socket = srp_challenge(server)
+      :ok = stop_supervised(:closing)
+      assert :ssl.recv(socket, 0, 2_000) == {:error, :closed}
+    end
+
+    test "withdraws a request waiting for Allow, and the sibling stops waiting" do
+      {server, _} = start_server(id: :asking, approve: {:ask, self()})
+      test = self()
+      code = code(server)
+
+      spawn(fn ->
+        send(test, {:paired, Client.pair(target(server), {:code, code}, identity())})
+      end)
+
+      assert_receive {:mob_pair_request, ^server, ref, _request}, 2_000
+
+      :ok = stop_supervised(:asking)
+      assert_receive {:mob_pair_withdrawn, ^server, ^ref}, 2_000
+      assert_receive {:paired, {:error, _}}, 2_000
+    end
+
+    test "a responder that stops doesn't take the host down" do
+      {server, _} = start_server(advertise: [bind: {{127, 0, 0, 1}, 0}])
+      responder = Host.responder(server)
+      ref = Process.monitor(responder)
+      Process.exit(responder, :kill)
+      assert_receive {:DOWN, ^ref, :process, _, :killed}
+
+      assert %{advertising: false, status: :open} = Host.info(server)
+      assert {:ok, _} = Client.pair(target(server), {:code, code(server)}, identity())
+    end
+  end
+
+  describe "mDNS" do
+    if @two_subnets == nil, do: @tag(skip: "needs IPv4 addresses on two subnets")
+
+    test "the host answers only queries from its link's subnet" do
+      {lan, other} = @two_subnets
+      host = lan |> :inet.ntoa() |> to_string()
+
+      {server, _} =
+        start_server(ip: {0, 0, 0, 0}, host: host, advertise: [bind: {{0, 0, 0, 0}, 0}])
+
+      port = Responder.port(Host.responder(server))
+      query = Dns.encode_query([%{name: ["_fmutate", "_tcp", "local"], type: :ptr}], 7)
+
+      answered =
+        for from <- [lan, other] do
+          {:ok, socket} = :gen_udp.open(0, [:binary, active: true, ip: from])
+          # to the responder (bound to every address) on the sender's own
+          # interface, as a querier on that subnet would reach it
+          :ok = :gen_udp.send(socket, from, port, query)
+
+          receive do
+            {:udp, ^socket, _ip, _port, _reply} -> :gen_udp.close(socket) && true
+          after
+            500 -> :gen_udp.close(socket) && false
+          end
+        end
+
+      assert answered == [true, false]
+    end
+  end
+
+  describe "typed code candidates" do
+    test "forged candidates from one address can't crowd the genuine host out of the tries" do
+      {server, fmutate} = start_server([])
+      dead = free_port()
+
+      forged =
+        for n <- 1..9,
+            do: Map.merge(candidate(nil), %{name: "Forged #{n}", port: dead, source: "10.0.0.66"})
+
+      genuine = Map.put(candidate(server), :source, "127.0.0.1")
+      pairing = start_pairing(discovery: fn _ -> {:ok, forged ++ [genuine]} end)
+
+      :ok = Join.pair(self(), %{code: Host.code(server)}, pairing)
+      assert_receive {:installed, %{fp: fp}}, 5_000
+      assert fp == fmutate.fp
+    end
+
+    test "a typed code goes past a host whose SRP proof doesn't hold" do
+      {server, fmutate} = start_server([])
+      rogue = Map.merge(candidate(nil), %{port: rogue_srp_host(), source: "10.0.0.66"})
+      genuine = Map.put(candidate(server), :source, "127.0.0.1")
+      pairing = start_pairing(discovery: fn _ -> {:ok, [rogue, genuine]} end)
+
+      :ok = Join.pair(self(), %{code: Host.code(server)}, pairing)
+      assert_receive {:installed, %{fp: fp}}, 5_000
+      assert fp == fmutate.fp
+    end
+  end
+
+  defp tls_connect(host, port), do: :ssl.connect(host, port, any_cert(), 2_000)
+
+  # A connection that sent an SRP hello and got the host's challenge.
+  defp srp_challenge(server) do
+    {:ok, socket} = tls_connect(~c"127.0.0.1", Host.port(server))
+    {a_pub, _} = Srp.client_keys()
+    hello = %{"type" => "hello", "v" => 1, "inst" => "a", "auth" => "srp"}
+    :ok = Wire.send(socket, Map.put(hello, "A", Wire.b64(a_pub)))
+    assert {:ok, %{"type" => "challenge"}} = Wire.recv(socket, 5_000)
+    socket
+  end
+
+  # Answers every SRP hello with a challenge and every proof with a welcome
+  # whose M2 proves nothing (the joiner sees :fingerprint_mismatch).
+  defp rogue_srp_host do
+    cert = Cert.self_signed("Rogue")
+
+    options =
+      [certs_keys: [Cert.ssl_cert_key(cert.cert, cert.key)], ip: {127, 0, 0, 1}] ++
+        Wire.socket_options()
+
+    {:ok, listen} = :ssl.listen(0, options)
+    {:ok, {_, port}} = :ssl.sockname(listen)
+    pid = spawn(fn -> rogue_serve(listen) end)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    port
+  end
+
+  defp rogue_serve(listen) do
+    with {:ok, transport} <- :ssl.transport_accept(listen) do
+      salt = Srp.salt()
+      {b_pub, _} = Srp.server_keys(Srp.verifier("00000000", salt, "fmutate"))
+      challenge = %{"type" => "challenge", "salt" => Wire.b64(salt), "B" => Wire.b64(b_pub)}
+      welcome = %{"type" => "welcome", "M2" => Wire.b64(:crypto.strong_rand_bytes(32))}
+
+      with {:ok, socket} <- :ssl.handshake(transport, 5_000),
+           {:ok, %{"type" => "hello"}} <- Wire.recv(socket, 5_000),
+           :ok <- Wire.send(socket, challenge),
+           {:ok, %{"type" => "proof"}} <- Wire.recv(socket, 5_000),
+           do: Wire.send(socket, welcome)
+
+      rogue_serve(listen)
+    end
+  end
+
+  defp free_port do
+    {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})
+    {:ok, port} = :inet.port(socket)
+    :gen_tcp.close(socket)
+    port
   end
 
   defp any_cert,

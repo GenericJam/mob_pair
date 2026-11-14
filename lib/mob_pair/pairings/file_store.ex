@@ -29,6 +29,15 @@ defmodule MobPair.Pairings.FileStore do
     Pairings.write_private(Keyword.fetch!(opts, :path), json)
   end
 
+  @impl true
+  def delete(opts) do
+    case File.rm(Keyword.fetch!(opts, :path)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp encode(p) do
     %{
       "node" => p.node,

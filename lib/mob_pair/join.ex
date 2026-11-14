@@ -12,8 +12,8 @@ defmodule MobPair.Join do
 
     * `{:mob_pair, :found, [candidate]}` while `discover/2` runs: each time
       the list of hosts nearby changes (`MobPair.Discovery` candidates:
-      `%{name, inst, node, host, port, dist_port, fp, firmware, device}`;
-      `port` is nil when that host isn't showing its Pair screen).
+      `%{name, inst, node, host, source, port, dist_port, fp, firmware,
+      device}`; `port` is nil when that host isn't showing its Pair screen).
     * `{:mob_pair, :matched, candidate}`: the host proved itself and took
       the token or code ("code matches" on its screen).
     * `{:mob_pair, :waiting}`: the host is asking its user (Allow).
@@ -314,19 +314,39 @@ defmodule MobPair.Join do
   end
 
   # Runs in its own process: tries each candidate in turn until one pairs.
-  # mDNS is unauthenticated: only unicast IPv4 (or this phone) is tried, and
-  # at most @max_tries hosts per code, so forged answers can't stall the
-  # pairing for long or send it to multicast or unspecified addresses.
+  # mDNS is unauthenticated: only unicast IPv4 (or this phone) is tried, at
+  # most @max_tries hosts per code, and taken in turns from each source
+  # address (in random order), so forged answers can't stall the pairing for
+  # long, crowd the genuine host out of the tries, or send it to multicast
+  # or unspecified addresses.
   defp run_pairing(server, context, auth) do
     candidates =
       (context.candidates || context.browse.())
       |> Enum.filter(&(&1.port && (Record.remote_unicast?(&1.host) or loopback?(&1.host))))
+      |> interleave()
       |> Enum.take(@max_tries)
 
     case try_candidates(candidates, context, auth, :not_found) do
       {:ok, record, candidate} -> send(server, {:paired, self(), record, candidate})
       {:error, reason} -> send(server, {:pair_failed, self(), reason})
     end
+  end
+
+  # One candidate from each source address in turn, the sources shuffled.
+  defp interleave(candidates) do
+    candidates
+    |> Enum.group_by(&Map.get(&1, :source, &1.host))
+    |> Map.values()
+    |> Enum.shuffle()
+    |> round_robin([])
+  end
+
+  defp round_robin([], taken), do: Enum.reverse(taken)
+
+  defp round_robin(groups, taken) do
+    firsts = Enum.map(groups, &hd/1)
+    rests = for [_ | rest] <- groups, rest != [], do: rest
+    round_robin(rests, Enum.reverse(firsts, taken))
   end
 
   defp loopback?(host), do: is_binary(host) and Record.loopback?(host)
@@ -342,9 +362,15 @@ defmodule MobPair.Join do
       fp: link_fp(auth, candidate)
     }
 
+    proven = make_ref()
+
     notify = fn
-      :authenticated -> send(context.owner, {:mob_pair, :matched, candidate})
-      :pending -> send(context.owner, {:mob_pair, :waiting})
+      :authenticated ->
+        send(self(), proven)
+        send(context.owner, {:mob_pair, :matched, candidate})
+
+      :pending ->
+        send(context.owner, {:mob_pair, :waiting})
     end
 
     case Client.pair(target, auth, context.identity, notify) do
@@ -352,23 +378,27 @@ defmodule MobPair.Join do
         {:ok, record, candidate}
 
       {:error, reason} = error ->
-        # A typed code may belong to another host nearby: keep looking
-        # unless this one got far enough to be the right one.
-        if match?({:code, _}, auth) and retry_elsewhere?(reason),
+        # A typed code may belong to another host nearby, and anyone can
+        # answer mDNS: whatever went wrong before this host proved it knows
+        # the code (unreachable, busy, a wrong code, a bad or missing SRP
+        # proof, a protocol error) is this candidate's, so keep looking.
+        if match?({:code, _}, auth) and not proven?(proven),
           do: try_candidates(rest, context, auth, better(best, reason)),
           else: error
+    end
+  end
+
+  defp proven?(proven) do
+    receive do
+      ^proven -> true
+    after
+      0 -> false
     end
   end
 
   # Only a link carries the fingerprint to pin; a code proves it via SRP.
   defp link_fp({:token, _}, candidate), do: candidate.fp
   defp link_fp({:code, _}, _candidate), do: nil
-
-  defp retry_elsewhere?({:wrong_code, _}), do: true
-
-  defp retry_elsewhere?(reason),
-    do:
-      reason in [:unreachable, :not_pairing, :busy, :expired, :too_many_attempts, :loopback_only]
 
   # The error to report when no candidate pairs: a wrong code says the most.
   defp better({:wrong_code, _} = best, _reason), do: best
