@@ -60,7 +60,7 @@ defmodule MobPair.Discovery do
   most 4 instances, so a flood of names from one machine can't crowd the
   others out of the 64 kept.
 
-  Candidates are deduplicated by `{fp, inst, host, dist_port}` (the latest
+  Candidates are deduplicated by `{source, fp, inst, host, port, dist_port}` (the latest
   answer wins; anything that changes where Humdinger would connect is a
   separate candidate) and ordered by name. Every string is the binary from
   the packet; no atoms are created from network data. Malformed packets are
@@ -412,7 +412,8 @@ defmodule MobPair.Discovery do
     end)
     |> Enum.sort_by(fn {seq, _candidate} -> seq end)
     |> Map.new(fn {_seq, candidate} ->
-      {{candidate.fp, candidate.inst, candidate.host, candidate.dist_port}, candidate}
+      {{candidate.source, candidate.fp, candidate.inst, candidate.host, candidate.port,
+        candidate.dist_port}, candidate}
     end)
     |> Map.values()
     |> Enum.sort_by(& &1.name)

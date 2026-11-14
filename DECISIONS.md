@@ -131,7 +131,7 @@ rather than changing v1's; JSON keeps both ends free of atoms from the network.
   be used under another pairing's name (the cookie check then still applies).
 - **mDNS is unauthenticated:** answers only produce candidates to *try* (pinned TLS + cookie
   decide); a reply is accepted only with one of the query's ids, and records are kept per
-  reply source IP (the port doesn't count), at most 4 instances per source, so a forged reply
+  reply source IP (the port doesn't count, the source is part of a candidate's identity), at most 4 instances per source, so a forged reply
   is a second candidate, never a replacement, and one machine can't crowd out another. A typed
   code is tried against at most 8 candidates, unicast IPv4 or loopback only, round-robin
   across sources in random order; a candidate that fails before it authenticated

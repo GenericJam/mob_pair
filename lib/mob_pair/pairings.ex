@@ -305,10 +305,10 @@ defmodule MobPair.Pairings do
         state = cut(state, pairing.node)
         put(pairing, state)
         atom = String.to_existing_atom(pairing.node)
-        state = %{state | revoked: Map.delete(state.revoked, atom)}
-
+        # the new pairing owns the name once stored; until then the revoke guard stays
         case persist(state) do
           {:ok, state} ->
+            state = %{state | revoked: Map.delete(state.revoked, atom)}
             notify(state, :added, pairing)
             {:reply, {:ok, pairing}, state}
 
