@@ -56,6 +56,26 @@ defmodule MobPair.PairingsTest do
     assert Pairings.pinned?(a.client_fp)
   end
 
+  test "a revoke sticks even with a net_setuptime net_kernel would ignore", %{store: store} do
+    previous = Application.fetch_env(:kernel, :net_setuptime)
+    Application.put_env(:kernel, :net_setuptime, :infinity)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:kernel, :net_setuptime, value)
+        :error -> Application.delete_env(:kernel, :net_setuptime)
+      end
+    end)
+
+    start_supervised!({Pairings, store: store})
+    {:ok, _} = Pairings.add(request("humdinger_a@127.0.0.1"))
+    assert :ok = Pairings.revoke("humdinger_a@127.0.0.1")
+    stop_supervised!(Pairings)
+
+    start_supervised!({Pairings, store: store})
+    assert Pairings.list() == []
+  end
+
   test "an unreadable store starts empty instead of crashing", %{path: path, store: store} do
     File.write!(path, "{")
     start_supervised!({Pairings, store: store})

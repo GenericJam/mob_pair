@@ -332,9 +332,10 @@ defmodule MobPair.Pairings do
     end
   end
 
-  # Twice the distribution setup time: any handshake that read the old
-  # cookie has finished or timed out by then.
-  defp revoke_window, do: round(:application.get_env(:kernel, :net_setuptime, 7) * 2_000)
+  # Twice the distribution setup time, as net_kernel reads it (ms, a bad
+  # setting falls back to 7 s): any handshake that read the old cookie has
+  # finished or timed out by then.
+  defp revoke_window, do: 2 * :net_kernel.connecttime()
 
   defp abort_handshake(atom) do
     case :net_kernel.node_info(atom) do
